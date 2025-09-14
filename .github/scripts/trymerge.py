@@ -17,25 +17,17 @@ import re
 import time
 import urllib.parse
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
-from typing import (
-    Any,
-    Callable,
-    cast,
-    Dict,
-    Iterable,
-    List,
-    NamedTuple,
-    Optional,
-    Pattern,
-    Tuple,
-)
+from re import Pattern
+from typing import Any, Callable, cast, NamedTuple, Optional
 from warnings import warn
 
 import yaml
 from github_utils import (
+    gh_close_pr,
     gh_fetch_json_list,
     gh_fetch_merge_base,
     gh_fetch_url,
@@ -77,7 +69,7 @@ class JobCheckState(NamedTuple):
     summary: Optional[str]
 
 
-JobNameToStateDict = Dict[str, JobCheckState]
+JobNameToStateDict = dict[str, JobCheckState]
 
 
 class WorkflowCheckState:
@@ -116,10 +108,6 @@ GH_CHECKSUITES_FRAGMENT = """
 fragment PRCheckSuites on CheckSuiteConnection {
   edges {
     node {
-      app {
-        name
-        databaseId
-      }
       workflowRun {
         workflow {
           name
@@ -442,7 +430,7 @@ query ($owner: String!, $name: String!) {
 RE_GHSTACK_HEAD_REF = re.compile(r"^(gh/[^/]+/[0-9]+/)head$")
 RE_GHSTACK_DESC = re.compile(r"Stack.*:\r?\n(\* [^\r\n]+\r?\n)+", re.MULTILINE)
 RE_PULL_REQUEST_RESOLVED = re.compile(
-    r"Pull Request resolved: "
+    r"(Pull Request resolved|Pull-Request-resolved|Pull-Request): "
     r"https://github.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>[0-9]+)",
     re.MULTILINE,
 )
@@ -451,8 +439,6 @@ RE_DIFF_REV = re.compile(r"^Differential Revision:.+?(D[0-9]+)", re.MULTILINE)
 CIFLOW_LABEL = re.compile(r"^ciflow/.+")
 CIFLOW_TRUNK_LABEL = re.compile(r"^ciflow/trunk")
 MERGE_RULE_PATH = Path(".github") / "merge_rules.yaml"
-ROCKSET_MERGES_COLLECTION = "merges"
-ROCKSET_MERGES_WORKSPACE = "commons"
 REMOTE_MAIN_BRANCH = "origin/main"
 DRCI_CHECKRUN_NAME = "Dr.CI"
 INTERNAL_CHANGES_CHECKRUN_NAME = "Meta Internal-Only Changes Check"
@@ -464,15 +450,72 @@ HAS_NO_CONNECTED_DIFF_TITLE = (
 IGNORABLE_FAILED_CHECKS_THESHOLD = 10
 
 
+def iter_issue_timeline_until_comment(
+    org: str, repo: str, issue_number: int, target_comment_id: int, max_pages: int = 200
+) -> Any:
+    """
+    Yield timeline entries in order until (and including) the entry whose id == target_comment_id
+    for a 'commented' event. Stops once the target comment is encountered.
+    """
+    page = 1
+
+    while page <= max_pages:
+        url = (
+            f"https://api.github.com/repos/{org}/{repo}/issues/{issue_number}/timeline"
+        )
+        params = {"per_page": 100, "page": page}
+
+        batch = gh_fetch_json_list(url, params)
+
+        if not batch:
+            return
+        for ev in batch:
+            # The target is the issue comment row with event == "commented" and id == issue_comment_id
+            if ev.get("event") == "commented" and ev.get("id") == target_comment_id:
+                yield ev  # nothing in the timeline after this matters, so stop early
+                return
+            yield ev
+        if len(batch) < 100:
+            return
+        page += 1
+
+    # If we got here without finding the comment, then we either hit a bug or some github PR
+    # has a _really_ long timeline.
+    # The max # of pages found on any pytorch/pytorch PR at the time of this change was 41
+    raise RuntimeError(
+        f"Could not find a merge commit in the first {max_pages} pages of the timeline at url {url}."
+        f"This is most likely a bug, please report it to the @pytorch/pytorch-dev-infra team."
+    )
+
+
+def sha_from_committed_event(ev: dict[str, Any]) -> Optional[str]:
+    """Extract SHA from committed event in timeline"""
+    return ev.get("sha")
+
+
+def sha_from_force_push_after(ev: dict[str, Any]) -> Optional[str]:
+    """Extract SHA from force push event in timeline"""
+    # The current GitHub API format
+    commit_id = ev.get("commit_id")
+    if commit_id:
+        return str(commit_id)
+
+    # Legacy format
+    after = ev.get("after") or ev.get("after_commit") or {}
+    if isinstance(after, dict):
+        return after.get("sha") or after.get("oid")
+    return ev.get("after_sha") or ev.get("head_sha")
+
+
 def gh_get_pr_info(org: str, proj: str, pr_no: int) -> Any:
     rc = gh_graphql(GH_GET_PR_INFO_QUERY, name=proj, owner=org, number=pr_no)
     return rc["data"]["repository"]["pullRequest"]
 
 
-@lru_cache(maxsize=None)
-def gh_get_team_members(org: str, name: str) -> List[str]:
-    rc: List[str] = []
-    team_members: Dict[str, Any] = {
+@cache
+def gh_get_team_members(org: str, name: str) -> list[str]:
+    rc: list[str] = []
+    team_members: dict[str, Any] = {
         "pageInfo": {"hasNextPage": "true", "endCursor": None}
     }
     while bool(team_members["pageInfo"]["hasNextPage"]):
@@ -495,7 +538,7 @@ def get_check_run_name_prefix(workflow_run: Any) -> str:
     if workflow_run is None:
         return ""
     else:
-        return f'{workflow_run["workflow"]["name"]} / '
+        return f"{workflow_run['workflow']['name']} / "
 
 
 def is_passing_status(status: Optional[str]) -> bool:
@@ -504,14 +547,14 @@ def is_passing_status(status: Optional[str]) -> bool:
 
 def add_workflow_conclusions(
     checksuites: Any,
-    get_next_checkruns_page: Callable[[List[Dict[str, Dict[str, Any]]], int, Any], Any],
+    get_next_checkruns_page: Callable[[list[dict[str, dict[str, Any]]], int, Any], Any],
     get_next_checksuites: Callable[[Any], Any],
 ) -> JobNameToStateDict:
     # graphql seems to favor the most recent workflow run, so in theory we
     # shouldn't need to account for reruns, but do it just in case
 
     # workflow -> job -> job info
-    workflows: Dict[str, WorkflowCheckState] = {}
+    workflows: dict[str, WorkflowCheckState] = {}
 
     # for the jobs that don't have a workflow
     no_workflow_obj: WorkflowCheckState = WorkflowCheckState("", "", 0, None)
@@ -555,7 +598,7 @@ def add_workflow_conclusions(
                     if not isinstance(checkrun_node, dict):
                         warn(f"Expected dictionary, but got {type(checkrun_node)}")
                         continue
-                    checkrun_name = f'{get_check_run_name_prefix(workflow_run)}{checkrun_node["name"]}'
+                    checkrun_name = f"{get_check_run_name_prefix(workflow_run)}{checkrun_node['name']}"
                     existing_checkrun = workflow_obj.jobs.get(checkrun_name)
                     if existing_checkrun is None or not is_passing_status(
                         existing_checkrun.status
@@ -634,15 +677,21 @@ def _revlist_to_prs(
     pr: "GitHubPR",
     rev_list: Iterable[str],
     should_skip: Optional[Callable[[int, "GitHubPR"], bool]] = None,
-) -> List[Tuple["GitHubPR", str]]:
-    rc: List[Tuple[GitHubPR, str]] = []
+) -> list[tuple["GitHubPR", str]]:
+    rc: list[tuple[GitHubPR, str]] = []
     for idx, rev in enumerate(rev_list):
         msg = repo.commit_message(rev)
-        m = RE_PULL_REQUEST_RESOLVED.search(msg)
-        if m is None:
+        # findall doesn't return named captures, so we need to use finditer
+        all_matches = list(RE_PULL_REQUEST_RESOLVED.finditer(msg))
+        if len(all_matches) != 1:
             raise RuntimeError(
-                f"Could not find PR-resolved string in {msg} of ghstacked PR {pr.pr_num}"
+                f"Found an unexpected number of PRs mentioned in commit {rev}: "
+                f"{len(all_matches)}.  This is probably because you are using an "
+                "old version of ghstack.  Please update ghstack and resubmit "
+                "your PRs"
             )
+
+        m = all_matches[0]
         if pr.org != m.group("owner") or pr.project != m.group("repo"):
             raise RuntimeError(
                 f"PR {m.group('number')} resolved to wrong owner/repo pair"
@@ -657,7 +706,7 @@ def _revlist_to_prs(
 
 def get_ghstack_prs(
     repo: GitRepo, pr: "GitHubPR", open_only: bool = True
-) -> List[Tuple["GitHubPR", str]]:
+) -> list[tuple["GitHubPR", str]]:
     """
     Get the PRs in the stack that are below this PR (inclusive).  Throws error if any of the open PRs are out of sync.
     @:param open_only: Only return open PRs
@@ -670,12 +719,15 @@ def get_ghstack_prs(
         if not open_only or not candidate.is_closed():
             return False
         print(
-            f"Skipping {idx+1} of {len(rev_list)} PR (#{candidate.pr_num}) as its already been merged"
+            f"Skipping {idx + 1} of {len(rev_list)} PR (#{candidate.pr_num}) as its already been merged"
         )
         return True
 
     assert pr.is_ghstack_pr()
     entire_stack = _revlist_to_prs(repo, pr, reversed(rev_list), skip_func)
+    print(
+        f"Found {len(entire_stack)} PRs in the stack for {pr.pr_num}: {[x[0].pr_num for x in entire_stack]}"
+    )
 
     for stacked_pr, rev in entire_stack:
         if stacked_pr.is_closed():
@@ -702,14 +754,14 @@ class GitHubPR:
         self.project = project
         self.pr_num = pr_num
         self.info = gh_get_pr_info(org, project, pr_num)
-        self.changed_files: Optional[List[str]] = None
-        self.labels: Optional[List[str]] = None
+        self.changed_files: Optional[list[str]] = None
+        self.labels: Optional[list[str]] = None
         self.conclusions: Optional[JobNameToStateDict] = None
-        self.comments: Optional[List[GitHubComment]] = None
-        self._authors: Optional[List[Tuple[str, str]]] = None
-        self._reviews: Optional[List[Tuple[str, str]]] = None
+        self.comments: Optional[list[GitHubComment]] = None
+        self._authors: Optional[list[tuple[str, str]]] = None
+        self._reviews: Optional[list[tuple[str, str]]] = None
         self.merge_base: Optional[str] = None
-        self.submodules: Optional[List[str]] = None
+        self.submodules: Optional[list[str]] = None
 
     def is_closed(self) -> bool:
         return bool(self.info["closed"])
@@ -742,16 +794,24 @@ class GitHubPR:
     def last_commit(self) -> Any:
         return self.info["commits"]["nodes"][-1]["commit"]
 
+    def last_commit_sha(self, default: Optional[str] = None) -> str:
+        # for commits, the oid is the sha
+
+        if default is None:
+            return str(self.last_commit()["oid"])
+
+        return str(self.last_commit().get("oid", default))
+
     def get_merge_base(self) -> str:
         if self.merge_base:
             return self.merge_base
 
-        last_commit_oid = self.last_commit()["oid"]
+        last_commit_sha = self.last_commit_sha()
         # NB: We could use self.base_ref() here for regular PR, however, that doesn't
         # work for ghstack where the base is the custom branch, i.e. gh/USER/ID/base,
         # so let's just use main instead
         self.merge_base = gh_fetch_merge_base(
-            self.org, self.project, last_commit_oid, self.default_branch()
+            self.org, self.project, last_commit_sha, self.default_branch()
         )
 
         # Fallback to baseRefOid if the API call fails, i.e. rate limit. Note that baseRefOid
@@ -764,7 +824,7 @@ class GitHubPR:
 
         return self.merge_base
 
-    def get_changed_files(self) -> List[str]:
+    def get_changed_files(self) -> list[str]:
         if self.changed_files is None:
             info = self.info
             unique_changed_files = set()
@@ -787,14 +847,14 @@ class GitHubPR:
             raise RuntimeError("Changed file count mismatch")
         return self.changed_files
 
-    def get_submodules(self) -> List[str]:
+    def get_submodules(self) -> list[str]:
         if self.submodules is None:
             rc = gh_graphql(GH_GET_REPO_SUBMODULES, name=self.project, owner=self.org)
             info = rc["data"]["repository"]["submodules"]
             self.submodules = [s["path"] for s in info["nodes"]]
         return self.submodules
 
-    def get_changed_submodules(self) -> List[str]:
+    def get_changed_submodules(self) -> list[str]:
         submodules = self.get_submodules()
         return [f for f in self.get_changed_files() if f in submodules]
 
@@ -810,7 +870,7 @@ class GitHubPR:
             and all("submodule" not in label for label in self.get_labels())
         )
 
-    def _get_reviews(self) -> List[Tuple[str, str]]:
+    def _get_reviews(self) -> list[tuple[str, str]]:
         if self._reviews is None:
             self._reviews = []
             info = self.info
@@ -829,27 +889,64 @@ class GitHubPR:
                     cursor=info["reviews"]["pageInfo"]["startCursor"],
                 )
                 info = rc["data"]["repository"]["pullRequest"]
-        reviews = {}
-        for author, state in self._reviews:
-            if state != "COMMENTED":
-                reviews[author] = state
+        reviews = {
+            author: state for author, state in self._reviews if state != "COMMENTED"
+        }
         return list(reviews.items())
 
-    def get_approved_by(self) -> List[str]:
+    def get_approved_by(self) -> list[str]:
         return [login for (login, state) in self._get_reviews() if state == "APPROVED"]
 
     def get_commit_count(self) -> int:
         return int(self.info["commits_with_authors"]["totalCount"])
 
+    def get_commit_sha_at_comment(self, comment_id: int) -> Optional[str]:
+        """
+        Get the PR head commit SHA that was present when a specific comment was posted.
+        This ensures we only merge the state of the PR at the time the merge command was issued,
+        not any subsequent commits that may have been pushed after.
+
+        Returns None if no head-changing events found before the comment or if the comment was not found.
+        """
+        head = None
+
+        try:
+            for event in iter_issue_timeline_until_comment(
+                self.org, self.project, self.pr_num, comment_id
+            ):
+                etype = event.get("event")
+                if etype == "committed":
+                    sha = sha_from_committed_event(event)
+                    if sha:
+                        head = sha
+                        print(f"Timeline: Found commit event for SHA {sha}")
+                elif etype == "head_ref_force_pushed":
+                    sha = sha_from_force_push_after(event)
+                    if sha:
+                        head = sha
+                        print(f"Timeline: Found force push event for SHA {sha}")
+                elif etype == "commented":
+                    if event.get("id") == comment_id:
+                        print(f"Timeline: Found final comment with sha {sha}")
+                        return head
+        except Exception as e:
+            print(
+                f"Warning: Failed to reconstruct timeline for comment {comment_id}: {e}"
+            )
+            return None
+
+        print(f"Did not find comment with id {comment_id} in the PR timeline")
+        return None
+
     def get_pr_creator_login(self) -> str:
         return cast(str, self.info["author"]["login"])
 
-    def _fetch_authors(self) -> List[Tuple[str, str]]:
+    def _fetch_authors(self) -> list[tuple[str, str]]:
         if self._authors is not None:
             return self._authors
-        authors: List[Tuple[str, str]] = []
+        authors: list[tuple[str, str]] = []
 
-        def add_authors(info: Dict[str, Any]) -> None:
+        def add_authors(info: dict[str, Any]) -> None:
             for node in info["commits_with_authors"]["nodes"]:
                 for author_node in node["commit"]["authors"]["nodes"]:
                     user_node = author_node["user"]
@@ -882,7 +979,7 @@ class GitHubPR:
     def get_committer_author(self, num: int = 0) -> str:
         return self._fetch_authors()[num][1]
 
-    def get_labels(self) -> List[str]:
+    def get_labels(self) -> list[str]:
         if self.labels is not None:
             return self.labels
         labels = (
@@ -900,7 +997,7 @@ class GitHubPR:
         orig_last_commit = self.last_commit()
 
         def get_pr_next_check_runs(
-            edges: List[Dict[str, Dict[str, Any]]], edge_idx: int, checkruns: Any
+            edges: list[dict[str, dict[str, Any]]], edge_idx: int, checkruns: Any
         ) -> Any:
             rc = gh_graphql(
                 GH_GET_PR_NEXT_CHECK_RUNS,
@@ -950,9 +1047,15 @@ class GitHubPR:
                     summary=None,
                 )
 
+        # Making an exception for Apply lint auggestions/autoformat because the
+        # bot adds a merged label -> triggers workflow -> sometimes needs
+        # approval -> is read as failure, which results in a blocked merge, but
+        # this workflow doesn't provide mergability info
+        self.conclusions.pop("Apply lint suggestions", None)
+
         return self.conclusions
 
-    def get_authors(self) -> Dict[str, str]:
+    def get_authors(self) -> dict[str, str]:
         rc = {}
         for idx in range(len(self._fetch_authors())):
             rc[self.get_committer_login(idx)] = self.get_committer_author(idx)
@@ -996,7 +1099,7 @@ class GitHubPR:
             url=node["url"],
         )
 
-    def get_comments(self) -> List[GitHubComment]:
+    def get_comments(self) -> list[GitHubComment]:
         if self.comments is not None:
             return self.comments
         self.comments = []
@@ -1070,7 +1173,7 @@ class GitHubPR:
         skip_mandatory_checks: bool,
         comment_id: Optional[int] = None,
         skip_all_rule_checks: bool = False,
-    ) -> List["GitHubPR"]:
+    ) -> list["GitHubPR"]:
         assert self.is_ghstack_pr()
         ghstack_prs = get_ghstack_prs(
             repo, self, open_only=False
@@ -1100,7 +1203,7 @@ class GitHubPR:
     def gen_commit_message(
         self,
         filter_ghstack: bool = False,
-        ghstack_deps: Optional[List["GitHubPR"]] = None,
+        ghstack_deps: Optional[list["GitHubPR"]] = None,
     ) -> str:
         """Fetches title and body from PR description
         adds reviewed by, pull request resolved and optionally
@@ -1140,7 +1243,10 @@ class GitHubPR:
             if label_base in label:
                 count += 1
                 full_label = f"{label_base}X{count}"
-        gh_add_labels(self.org, self.project, self.pr_num, [full_label], dry_run)
+        self.add_label(full_label, dry_run)
+
+    def add_label(self, label: str, dry_run: bool) -> None:
+        gh_add_labels(self.org, self.project, self.pr_num, [label], dry_run)
 
     def merge_into(
         self,
@@ -1148,8 +1254,8 @@ class GitHubPR:
         *,
         skip_mandatory_checks: bool = False,
         dry_run: bool = False,
-        comment_id: Optional[int] = None,
-        ignore_current_checks: Optional[List[str]] = None,
+        comment_id: int,
+        ignore_current_checks: Optional[list[str]] = None,
     ) -> None:
         # Raises exception if matching rule is not found
         (
@@ -1164,7 +1270,7 @@ class GitHubPR:
             skip_internal_checks=can_skip_internal_checks(self, comment_id),
             ignore_current_checks=ignore_current_checks,
         )
-        additional_merged_prs = self.merge_changes(
+        additional_merged_prs = self.merge_changes_locally(
             repo, skip_mandatory_checks, comment_id
         )
 
@@ -1174,12 +1280,12 @@ class GitHubPR:
             for pr in additional_merged_prs:
                 pr.add_numbered_label(MERGE_COMPLETE_LABEL, dry_run)
 
-        if comment_id and self.pr_num:
-            # When the merge process reaches this part, we can assume that the commit
-            # has been successfully pushed to trunk
-            merge_commit_sha = repo.rev_parse(name=REMOTE_MAIN_BRANCH)
+        # When the merge process reaches this part, we can assume that the commit
+        # has been successfully pushed to trunk
+        merge_commit_sha = repo.rev_parse(name=self.default_branch())
 
-            # Finally, upload the record to Rockset. The list of pending and failed
+        if comment_id and self.pr_num:
+            # Finally, upload the record to s3. The list of pending and failed
             # checks are at the time of the merge
             save_merge_record(
                 comment_id=comment_id,
@@ -1193,7 +1299,7 @@ class GitHubPR:
                 broken_trunk_checks=ignorable_checks.get("BROKEN_TRUNK", []),
                 flaky_checks=ignorable_checks.get("FLAKY", []),
                 unstable_checks=ignorable_checks.get("UNSTABLE", []),
-                last_commit_sha=self.last_commit().get("oid", ""),
+                last_commit_sha=self.last_commit_sha(default=""),
                 merge_base_sha=self.get_merge_base(),
                 merge_commit_sha=merge_commit_sha,
                 is_failed=False,
@@ -1201,36 +1307,85 @@ class GitHubPR:
                 ignore_current=bool(ignore_current_checks),
             )
         else:
-            print("Missing comment ID or PR number, couldn't upload to Rockset")
+            print("Missing comment ID or PR number, couldn't upload to s3")
 
-    def merge_changes(
+        # Usually Github will see that the commit has "resolves <pr_num>" in the
+        # commit message and close the PR, but sometimes it doesn't, leading to
+        # confusion.  When it doesn't, we close it manually.
+        time.sleep(60)  # Give Github some time to close the PR
+        manually_close_merged_pr(
+            pr=self,
+            additional_merged_prs=additional_merged_prs,
+            merge_commit_sha=merge_commit_sha,
+            dry_run=dry_run,
+        )
+
+    def merge_changes_locally(
         self,
         repo: GitRepo,
         skip_mandatory_checks: bool = False,
         comment_id: Optional[int] = None,
         branch: Optional[str] = None,
         skip_all_rule_checks: bool = False,
-    ) -> List["GitHubPR"]:
+    ) -> list["GitHubPR"]:
         """
-        :param skip_all_rule_checks: If true, skips all rule checks, useful for dry-running merge locally
+        :param skip_all_rule_checks: If true, skips all rule checks on ghstack PRs, useful for dry-running merge locally
         """
         branch_to_merge_into = self.default_branch() if branch is None else branch
         if repo.current_branch() != branch_to_merge_into:
             repo.checkout(branch_to_merge_into)
-        if not self.is_ghstack_pr():
-            msg = self.gen_commit_message()
-            pr_branch_name = f"__pull-request-{self.pr_num}__init__"
-            repo.fetch(f"pull/{self.pr_num}/head", pr_branch_name)
-            repo._run_git("merge", "--squash", pr_branch_name)
-            repo._run_git("commit", f'--author="{self.get_author()}"', "-m", msg)
-            return []
-        else:
+
+        # It's okay to skip the commit SHA check for ghstack PRs since
+        # authoring requires write access to the repo.
+        if self.is_ghstack_pr():
             return self.merge_ghstack_into(
                 repo,
                 skip_mandatory_checks,
                 comment_id=comment_id,
                 skip_all_rule_checks=skip_all_rule_checks,
             )
+
+        msg = self.gen_commit_message()
+        pr_branch_name = f"__pull-request-{self.pr_num}__init__"
+
+        # Determine which commit SHA to merge
+        commit_to_merge = None
+        if not comment_id:
+            raise ValueError("Must provide --comment-id when merging regular PRs")
+
+        # Get the commit SHA that was present when the comment was made
+        commit_to_merge = self.get_commit_sha_at_comment(comment_id)
+        if not commit_to_merge:
+            raise RuntimeError(
+                f"Could not find commit that was pushed before comment {comment_id}"
+            )
+
+        # Validate that this commit is the latest commit on the PR
+        latest_commit = self.last_commit_sha()
+        if commit_to_merge != latest_commit:
+            raise RuntimeError(
+                f"Commit {commit_to_merge} was HEAD when comment {comment_id} was posted "
+                f"but now the latest commit on the PR is {latest_commit}. "
+                f"Please re-issue the merge command to merge the latest commit."
+            )
+
+        print(f"Merging commit {commit_to_merge} locally")
+
+        repo.fetch(commit_to_merge, pr_branch_name)
+        repo._run_git("merge", "--squash", pr_branch_name)
+        repo._run_git("commit", f'--author="{self.get_author()}"', "-m", msg)
+
+        # Did the PR change since we started the merge?
+        pulled_sha = repo.show_ref(pr_branch_name)
+        latest_pr_status = GitHubPR(self.org, self.project, self.pr_num)
+        if (
+            pulled_sha != latest_pr_status.last_commit_sha()
+            or pulled_sha != commit_to_merge
+        ):
+            raise RuntimeError(
+                "PR has been updated since CI checks last passed. Please rerun the merge command."
+            )
+        return []
 
 
 class MergeRuleFailedError(RuntimeError):
@@ -1250,14 +1405,14 @@ class PostCommentError(Exception):
 @dataclass
 class MergeRule:
     name: str
-    patterns: List[str]
-    approved_by: List[str]
-    mandatory_checks_name: Optional[List[str]]
+    patterns: list[str]
+    approved_by: list[str]
+    mandatory_checks_name: Optional[list[str]]
     ignore_flaky_failures: bool = True
 
 
 def gen_new_issue_link(
-    org: str, project: str, labels: List[str], template: str = "bug-report.yml"
+    org: str, project: str, labels: list[str], template: str = "bug-report.yml"
 ) -> str:
     labels_str = ",".join(labels)
     return (
@@ -1269,7 +1424,7 @@ def gen_new_issue_link(
 
 def read_merge_rules(
     repo: Optional[GitRepo], org: str, project: str
-) -> List[MergeRule]:
+) -> list[MergeRule]:
     """Returns the list of all merge rules for the repo or project.
 
     NB: this function is used in Meta-internal workflows, see the comment
@@ -1299,12 +1454,12 @@ def find_matching_merge_rule(
     repo: Optional[GitRepo] = None,
     skip_mandatory_checks: bool = False,
     skip_internal_checks: bool = False,
-    ignore_current_checks: Optional[List[str]] = None,
-) -> Tuple[
+    ignore_current_checks: Optional[list[str]] = None,
+) -> tuple[
     MergeRule,
-    List[Tuple[str, Optional[str], Optional[int]]],
-    List[Tuple[str, Optional[str], Optional[int]]],
-    Dict[str, List[Any]],
+    list[tuple[str, Optional[str], Optional[int]]],
+    list[tuple[str, Optional[str], Optional[int]]],
+    dict[str, list[Any]],
 ]:
     """
     Returns merge rule matching to this pr together with the list of associated pending
@@ -1436,7 +1591,7 @@ def find_matching_merge_rule(
             pending_checks = []
             failed_checks = []
 
-        hud_link = f"https://hud.pytorch.org/{pr.org}/{pr.project}/commit/{pr.last_commit()['oid']}"
+        hud_link = f"https://hud.pytorch.org/{pr.org}/{pr.project}/commit/{pr.last_commit_sha()}"
         if len(failed_checks) > 0:
             if reject_reason_score < 30000:
                 reject_reason_score = 30000
@@ -1469,7 +1624,7 @@ def find_matching_merge_rule(
 
         # Categorize all checks when skip_mandatory_checks (force merge) is set. Do it here
         # where the list of checks is readily available. These records will be saved into
-        # Rockset merge records
+        # s3 merge records
         (
             pending_mandatory_checks,
             failed_mandatory_checks,
@@ -1491,16 +1646,74 @@ def find_matching_merge_rule(
     raise MergeRuleFailedError(reject_reason, rule)
 
 
-def checks_to_str(checks: List[Tuple[str, Optional[str]]]) -> str:
+def checks_to_str(checks: list[tuple[str, Optional[str]]]) -> str:
     return ", ".join(f"[{c[0]}]({c[1]})" if c[1] is not None else c[0] for c in checks)
 
 
 def checks_to_markdown_bullets(
-    checks: List[Tuple[str, Optional[str], Optional[int]]]
-) -> List[str]:
+    checks: list[tuple[str, Optional[str], Optional[int]]],
+) -> list[str]:
     return [
         f"- [{c[0]}]({c[1]})" if c[1] is not None else f"- {c[0]}" for c in checks[:5]
     ]
+
+
+def post_starting_merge_comment(
+    repo: GitRepo,
+    pr: GitHubPR,
+    explainer: TryMergeExplainer,
+    dry_run: bool,
+    ignore_current_checks_info: Optional[
+        list[tuple[str, Optional[str], Optional[int]]]
+    ] = None,
+) -> None:
+    """Post the initial merge starting message on the PR. Also post a short
+    message on all PRs in the stack."""
+    gh_post_pr_comment(
+        pr.org,
+        pr.project,
+        pr.pr_num,
+        explainer.get_merge_message(ignore_current_checks_info),
+        dry_run=dry_run,
+    )
+    if pr.is_ghstack_pr():
+        for additional_prs, _ in get_ghstack_prs(repo, pr):
+            if additional_prs.pr_num != pr.pr_num:
+                gh_post_pr_comment(
+                    additional_prs.org,
+                    additional_prs.project,
+                    additional_prs.pr_num,
+                    f"Starting merge as part of PR stack under #{pr.pr_num}",
+                    dry_run=dry_run,
+                )
+
+
+def manually_close_merged_pr(
+    pr: GitHubPR,
+    additional_merged_prs: list[GitHubPR],
+    merge_commit_sha: str,
+    dry_run: bool,
+) -> None:
+    def _comment_and_close(pr: GitHubPR, comment: str) -> None:
+        pr = GitHubPR(pr.org, pr.project, pr.pr_num)  # Refresh the PR
+        if not pr.is_closed():
+            gh_post_pr_comment(pr.org, pr.project, pr.pr_num, comment, dry_run)
+            gh_close_pr(pr.org, pr.project, pr.pr_num, dry_run)
+
+    message = (
+        f"This PR (#{pr.pr_num}) was merged in {merge_commit_sha} but it is still open, likely due to a Github bug, "
+        "so mergebot is closing it manually.  If you think this is a mistake, please feel free to reopen and contact Dev Infra."
+    )
+    _comment_and_close(pr, message)
+    for additional_pr in additional_merged_prs:
+        message = (
+            f"This PR (#{additional_pr.pr_num}) was merged as part of PR #{pr.pr_num} in the stack under {merge_commit_sha} "
+            "but it is still open, likely due to a Github bug, so mergebot is closing it manually. "
+            "If you think this is a mistake, please feel free to reopen and contact Dev Infra."
+        )
+        _comment_and_close(additional_pr, message)
+
+    print(f"PR {pr.pr_num} and all additional PRs in the stack have been closed.")
 
 
 @retries_decorator()
@@ -1510,12 +1723,12 @@ def save_merge_record(
     owner: str,
     project: str,
     author: str,
-    pending_checks: List[Tuple[str, Optional[str], Optional[int]]],
-    failed_checks: List[Tuple[str, Optional[str], Optional[int]]],
-    ignore_current_checks: List[Tuple[str, Optional[str], Optional[int]]],
-    broken_trunk_checks: List[Tuple[str, Optional[str], Optional[int]]],
-    flaky_checks: List[Tuple[str, Optional[str], Optional[int]]],
-    unstable_checks: List[Tuple[str, Optional[str], Optional[int]]],
+    pending_checks: list[tuple[str, Optional[str], Optional[int]]],
+    failed_checks: list[tuple[str, Optional[str], Optional[int]]],
+    ignore_current_checks: list[tuple[str, Optional[str], Optional[int]]],
+    broken_trunk_checks: list[tuple[str, Optional[str], Optional[int]]],
+    flaky_checks: list[tuple[str, Optional[str], Optional[int]]],
+    unstable_checks: list[tuple[str, Optional[str], Optional[int]]],
     last_commit_sha: str,
     merge_base_sha: str,
     merge_commit_sha: str = "",
@@ -1528,7 +1741,7 @@ def save_merge_record(
     This saves the merge records as a json, which can later be uploaded to s3
     """
 
-    # Prepare the record to be written into Rockset
+    # Prepare the record to be written into s3
     data = [
         {
             "comment_id": comment_id,
@@ -1550,7 +1763,8 @@ def save_merge_record(
             "ignore_current": ignore_current,
             "error": error,
             # This is a unique identifier for the record for deduping purposes
-            # in rockset.  Any unique string would work
+            # in Rockset.  Any unique string would work.  This will not be used
+            # after we migrate off Rockset
             "_id": f"{project}-{pr_num}-{comment_id}-{os.environ.get('GITHUB_RUN_ID')}",
         }
     ]
@@ -1558,36 +1772,6 @@ def save_merge_record(
 
     with open(repo_root / "merge_record.json", "w") as f:
         json.dump(data, f)
-
-
-@retries_decorator(rc=[])
-def get_rockset_results(head_sha: str, merge_base: str) -> List[Dict[str, Any]]:
-    query = f"""
-SELECT
-    w.name as workflow_name,
-    j.id,
-    j.name,
-    j.conclusion,
-    j.completed_at,
-    j.html_url,
-    j.head_sha,
-    j.torchci_classification.captures as failure_captures,
-    LENGTH(j.steps) as steps,
-FROM
-    commons.workflow_job j join commons.workflow_run w on w.id = j.run_id
-where
-    j.head_sha in ('{head_sha}','{merge_base}')
-"""
-    try:
-        import rockset  # type: ignore[import]
-
-        res = rockset.RocksetClient(
-            host="api.usw2a1.rockset.com", api_key=os.environ["ROCKSET_API_KEY"]
-        ).sql(query)
-        return cast(List[Dict[str, Any]], res.results)
-    except ModuleNotFoundError:
-        print("Could not use RockSet as rocket dependency is missing")
-        return []
 
 
 @retries_decorator()
@@ -1702,9 +1886,9 @@ def is_invalid_cancel(
 def get_classifications(
     pr_num: int,
     project: str,
-    checks: Dict[str, JobCheckState],
-    ignore_current_checks: Optional[List[str]],
-) -> Dict[str, JobCheckState]:
+    checks: dict[str, JobCheckState],
+    ignore_current_checks: Optional[list[str]],
+) -> dict[str, JobCheckState]:
     # Get the failure classification from Dr.CI, which is the source of truth
     # going forward. It's preferable to try calling Dr.CI API directly first
     # to get the latest results as well as update Dr.CI PR comment
@@ -1735,7 +1919,7 @@ def get_classifications(
         try:
             print(f"From Dr.CI checkrun summary: {drci_summary}")
             drci_classifications = json.loads(str(drci_summary))
-        except json.JSONDecodeError as error:
+        except json.JSONDecodeError:
             warn("Invalid Dr.CI checkrun summary")
             drci_classifications = {}
 
@@ -1813,7 +1997,7 @@ def get_classifications(
 
 def filter_checks_with_lambda(
     checks: JobNameToStateDict, status_filter: Callable[[Optional[str]], bool]
-) -> List[JobCheckState]:
+) -> list[JobCheckState]:
     return [check for check in checks.values() if status_filter(check.status)]
 
 
@@ -1829,14 +2013,16 @@ def get_pr_commit_sha(repo: GitRepo, pr: GitHubPR) -> str:
 
 def validate_revert(
     repo: GitRepo, pr: GitHubPR, *, comment_id: Optional[int] = None
-) -> Tuple[str, str]:
+) -> tuple[str, str]:
     comment = (
         pr.get_last_comment()
         if comment_id is None
         else pr.get_comment_by_id(comment_id)
     )
     if comment.editor_login is not None:
-        raise PostCommentError("Don't want to revert based on edited command")
+        raise PostCommentError(
+            "Halting the revert as the revert comment has been edited."
+        )
     author_association = comment.author_association
     author_login = comment.author_login
     allowed_reverters = ["COLLABORATOR", "MEMBER", "OWNER"]
@@ -1859,7 +2045,7 @@ def validate_revert(
 
 def get_ghstack_dependent_prs(
     repo: GitRepo, pr: GitHubPR, only_closed: bool = True
-) -> List[Tuple[str, GitHubPR]]:
+) -> list[tuple[str, GitHubPR]]:
     """
     Get the PRs in the stack that are above this PR (inclusive).
     Throws error if stack have branched or original branches are gone
@@ -1885,7 +2071,7 @@ def get_ghstack_dependent_prs(
     # Remove commits original PR depends on
     if skip_len > 0:
         rev_list = rev_list[:-skip_len]
-    rc: List[Tuple[str, GitHubPR]] = []
+    rc: list[tuple[str, GitHubPR]] = []
     for pr_, sha in _revlist_to_prs(repo, pr, rev_list):
         if not pr_.is_closed():
             if not only_closed:
@@ -1898,7 +2084,8 @@ def get_ghstack_dependent_prs(
 
 def do_revert_prs(
     repo: GitRepo,
-    shas_and_prs: List[Tuple[str, GitHubPR]],
+    original_pr: GitHubPR,
+    shas_and_prs: list[tuple[str, GitHubPR]],
     *,
     author_login: str,
     extra_msg: str = "",
@@ -1906,7 +2093,6 @@ def do_revert_prs(
     dry_run: bool = False,
 ) -> None:
     # Prepare and push revert commits
-    commit_shas: List[str] = []
     for commit_sha, pr in shas_and_prs:
         revert_msg = f"\nReverted {pr.get_pr_url()} on behalf of {prefix_with_github_url(author_login)}"
         revert_msg += extra_msg
@@ -1920,9 +2106,16 @@ def do_revert_prs(
 
     # Comment/reopen PRs
     for commit_sha, pr in shas_and_prs:
-        revert_message = (
-            f"@{pr.get_pr_creator_login()} your PR has been successfully reverted."
-        )
+        revert_message = ""
+        if pr.pr_num == original_pr.pr_num:
+            revert_message += (
+                f"@{pr.get_pr_creator_login()} your PR has been successfully reverted."
+            )
+        else:
+            revert_message += (
+                f"@{pr.get_pr_creator_login()} your PR has been reverted as part of the stack under "
+                f"#{original_pr.pr_num}.\n"
+            )
         if (
             pr.has_internal_changes()
             and not pr.has_no_connected_diff()
@@ -1935,6 +2128,7 @@ def do_revert_prs(
         )
 
         pr.add_numbered_label("reverted", dry_run)
+        pr.add_label("ci-no-td", dry_run)
         if not dry_run:
             gh_post_commit_comment(pr.org, pr.project, commit_sha, revert_msg)
             gh_update_pr_state(pr.org, pr.project, pr.pr_num)
@@ -1973,6 +2167,7 @@ def try_revert(
 
     do_revert_prs(
         repo,
+        pr,
         shas_and_prs,
         author_login=author_login,
         extra_msg=extra_msg,
@@ -1989,46 +2184,47 @@ def check_for_sev(org: str, project: str, skip_mandatory_checks: bool) -> None:
     if skip_mandatory_checks:
         return
     response = cast(
-        Dict[str, Any],
+        dict[str, Any],
         gh_fetch_json_list(
-            "https://api.github.com/search/issues",
-            params={"q": f'repo:{org}/{project} is:open is:issue label:"ci: sev"'},
+            "https://api.github.com/search/issues",  # @lint-ignore
+            # Having two label: queries is an AND operation
+            params={
+                "q": f'repo:{org}/{project} is:open is:issue label:"ci: sev" label:"merge blocking"'
+            },
         ),
     )
     if response["total_count"] != 0:
-        for item in response["items"]:
-            if "MERGE BLOCKING" in item["body"]:
-                raise RuntimeError(
-                    "Not merging any PRs at the moment because there is a "
-                    + "merge blocking https://github.com/pytorch/pytorch/labels/ci:%20sev issue open at: \n"
-                    + f"{item['html_url']}"
-                )
+        raise RuntimeError(
+            "Not merging any PRs at the moment because there is a "
+            + "merge blocking https://github.com/pytorch/pytorch/labels/ci:%20sev issue open at: \n"
+            + f"{response['items'][0]['html_url']}"
+        )
     return
 
 
-def has_label(labels: List[str], pattern: Pattern[str] = CIFLOW_LABEL) -> bool:
+def has_label(labels: list[str], pattern: Pattern[str] = CIFLOW_LABEL) -> bool:
     return len(list(filter(pattern.match, labels))) > 0
 
 
 def categorize_checks(
     check_runs: JobNameToStateDict,
-    required_checks: List[str],
+    required_checks: list[str],
     ok_failed_checks_threshold: Optional[int] = None,
-) -> Tuple[
-    List[Tuple[str, Optional[str], Optional[int]]],
-    List[Tuple[str, Optional[str], Optional[int]]],
-    Dict[str, List[Any]],
+) -> tuple[
+    list[tuple[str, Optional[str], Optional[int]]],
+    list[tuple[str, Optional[str], Optional[int]]],
+    dict[str, list[Any]],
 ]:
     """
     Categories all jobs into the list of pending and failing jobs. All known flaky
     failures and broken trunk are ignored by defaults when ok_failed_checks_threshold
     is not set (unlimited)
     """
-    pending_checks: List[Tuple[str, Optional[str], Optional[int]]] = []
-    failed_checks: List[Tuple[str, Optional[str], Optional[int]]] = []
+    pending_checks: list[tuple[str, Optional[str], Optional[int]]] = []
+    failed_checks: list[tuple[str, Optional[str], Optional[int]]] = []
 
-    # failed_checks_categorization is used to keep track of all ignorable failures when saving the merge record on Rockset
-    failed_checks_categorization: Dict[str, List[Any]] = defaultdict(list)
+    # failed_checks_categorization is used to keep track of all ignorable failures when saving the merge record on s3
+    failed_checks_categorization: dict[str, list[Any]] = defaultdict(list)
 
     # If required_checks is not set or empty, consider all names are relevant
     relevant_checknames = [
@@ -2086,21 +2282,21 @@ def categorize_checks(
     ):
         failed_checks = failed_checks + flaky_or_broken_trunk
 
-    # The list of failed_checks_categorization is returned so that it can be saved into the Rockset merge record
+    # The list of failed_checks_categorization is returned so that it can be saved into the s3 merge record
     return (pending_checks, failed_checks, failed_checks_categorization)
 
 
 def merge(
     pr: GitHubPR,
     repo: GitRepo,
+    comment_id: int,
     dry_run: bool = False,
     skip_mandatory_checks: bool = False,
-    comment_id: Optional[int] = None,
     timeout_minutes: int = 400,
     stale_pr_days: int = 3,
     ignore_current: bool = False,
 ) -> None:
-    initial_commit_sha = pr.last_commit()["oid"]
+    initial_commit_sha = pr.last_commit_sha()
     pr_link = f"https://github.com/{pr.org}/{pr.project}/pull/{pr.pr_num}"
     print(f"Attempting merge of {initial_commit_sha} ({pr_link})")
 
@@ -2126,13 +2322,7 @@ def merge(
     check_for_sev(pr.org, pr.project, skip_mandatory_checks)
 
     if skip_mandatory_checks:
-        gh_post_pr_comment(
-            pr.org,
-            pr.project,
-            pr.pr_num,
-            explainer.get_merge_message(),
-            dry_run=dry_run,
-        )
+        post_starting_merge_comment(repo, pr, explainer, dry_run)
         return pr.merge_into(
             repo,
             dry_run=dry_run,
@@ -2155,12 +2345,12 @@ def merge(
         )
         ignore_current_checks_info = failing
 
-    gh_post_pr_comment(
-        pr.org,
-        pr.project,
-        pr.pr_num,
-        explainer.get_merge_message(ignore_current_checks_info),
-        dry_run=dry_run,
+    post_starting_merge_comment(
+        repo,
+        pr,
+        explainer,
+        dry_run,
+        ignore_current_checks_info=ignore_current_checks_info,
     )
 
     start_time = time.time()
@@ -2177,7 +2367,7 @@ def merge(
             f"Attempting merge of https://github.com/{pr.org}/{pr.project}/pull/{pr.pr_num} ({elapsed_time / 60} minutes elapsed)"
         )
         pr = GitHubPR(pr.org, pr.project, pr.pr_num)
-        if initial_commit_sha != pr.last_commit()["oid"]:
+        if initial_commit_sha != pr.last_commit_sha():
             raise RuntimeError(
                 "New commits were pushed while merging. Please rerun the merge command."
             )
@@ -2246,7 +2436,8 @@ def merge(
         except MandatoryChecksMissingError as ex:
             last_exception = str(ex)
             print(
-                f"Merge of https://github.com/{pr.org}/{pr.project}/pull/{pr.pr_num} failed due to: {ex}. Retrying in 5 min"
+                f"Merge of https://github.com/{pr.org}/{pr.project}/pull/{pr.pr_num} failed due to: {ex}. Retrying in 5 min",
+                flush=True,
             )
             time.sleep(5 * 60)
     # Finally report timeout back
@@ -2343,7 +2534,7 @@ def main() -> None:
     if args.check_mergeability:
         if pr.is_ghstack_pr():
             get_ghstack_prs(repo, pr)  # raises error if out of sync
-        pr.merge_changes(
+        pr.merge_changes_locally(
             repo,
             skip_mandatory_checks=True,
             skip_all_rule_checks=True,
@@ -2358,19 +2549,25 @@ def main() -> None:
         gh_post_pr_comment(org, project, args.pr_num, message, dry_run=args.dry_run)
         return
     try:
+        # Ensure comment id is set, else fail
+        if not args.comment_id:
+            raise ValueError(
+                "Comment ID is required for merging PRs, please provide it using --comment-id"
+            )
+
         merge(
             pr,
             repo,
+            comment_id=args.comment_id,
             dry_run=args.dry_run,
             skip_mandatory_checks=args.force,
-            comment_id=args.comment_id,
             ignore_current=args.ignore_current,
         )
     except Exception as e:
         handle_exception(e)
 
         if args.comment_id and args.pr_num:
-            # Finally, upload the record to Rockset, we don't have access to the
+            # Finally, upload the record to s3, we don't have access to the
             # list of pending and failed checks here, but they are not really
             # needed at the moment
             save_merge_record(
@@ -2385,7 +2582,7 @@ def main() -> None:
                 broken_trunk_checks=[],
                 flaky_checks=[],
                 unstable_checks=[],
-                last_commit_sha=pr.last_commit().get("oid", ""),
+                last_commit_sha=pr.last_commit_sha(default=""),
                 merge_base_sha=pr.get_merge_base(),
                 is_failed=True,
                 skip_mandatory_checks=args.force,
@@ -2393,7 +2590,7 @@ def main() -> None:
                 error=str(e),
             )
         else:
-            print("Missing comment ID or PR number, couldn't upload to Rockset")
+            print("Missing comment ID or PR number, couldn't upload to s3")
     finally:
         if not args.check_mergeability:
             gh_remove_label(

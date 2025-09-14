@@ -125,7 +125,7 @@ Dtype Intrinsics::IntrinsicsDtype(
     IntrinsicsOp op_type,
     const std::vector<ExprPtr>& params) {
   // TODO: check the op_type and make a real decision
-  // Doesnt this fail with kRand?
+  // Doesn't this fail with kRand?
   if (params.empty()) {
     throw malformed_input("invalid params in Intrinsics");
   } else if (params.size() == 1) {
@@ -276,7 +276,7 @@ bool immediateIsPositive(const ExprPtr& e) {
   if (Name##ImmPtr imm = to<Name##Imm>(e)) { \
     return imm->value() > 0;                 \
   }
-  AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, TYPE_CASE);
+  AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, TYPE_CASE)
 #undef TYPE_CASE
   return false;
 }
@@ -286,7 +286,7 @@ bool immediateIsZero(const ExprPtr& e) {
   if (Name##ImmPtr imm = to<Name##Imm>(e)) { \
     return imm->value() == 0;                \
   }
-  AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, TYPE_CASE);
+  AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, TYPE_CASE)
 #undef TYPE_CASE
   return false;
 }

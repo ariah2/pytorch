@@ -12,6 +12,8 @@
 #include <c10/util/TypeTraits.h>
 #include <torch/custom_class_detail.h>
 #include <torch/library.h>
+
+#include <functional>
 #include <sstream>
 
 namespace torch {
@@ -117,7 +119,7 @@ class class_ : public ::torch::detail::class_base {
                                    c10::tagged_capsule<CurClass> self,
                                    ParameterTypes... arg) {
       c10::intrusive_ptr<CurClass> classObj =
-          at::guts::invoke(func, std::forward<ParameterTypes>(arg)...);
+          std::invoke(func, std::forward<ParameterTypes>(arg)...);
       auto object = self.ivalue.toObject();
       object->setSlot(0, c10::IValue::make_capsule(classObj));
     };
@@ -285,7 +287,7 @@ class class_ : public ::torch::detail::class_base {
   ///     __getstate__(intrusive_ptr<CurClass>) -> T1
   ///     __setstate__(T2) -> intrusive_ptr<CurClass>
   ///
-  /// `T1` must be an object that is convertable to IValue by the same rules
+  /// `T1` must be an object that is convertible to IValue by the same rules
   /// for custom op/method registration.
   ///
   /// For the common case, T1 == T2. T1 can also be a subtype of T2. An
@@ -304,7 +306,6 @@ class class_ : public ::torch::detail::class_base {
   ///               std::vector<std::string>{"i", "was", "deserialized"});
   ///         })
   template <typename GetStateFn, typename SetStateFn>
-  // NOLINTNEXTLINE(cppcoreguidelines-missing-std-forward)
   class_& def_pickle(GetStateFn&& get_state, SetStateFn&& set_state) {
     static_assert(
         c10::guts::is_stateless_lambda<std::decay_t<GetStateFn>>::value &&
@@ -325,7 +326,7 @@ class class_ : public ::torch::detail::class_base {
                                 c10::tagged_capsule<CurClass> self,
                                 SetStateArg arg) {
       c10::intrusive_ptr<CurClass> classObj =
-          at::guts::invoke(set_state, std::move(arg));
+          std::invoke(set_state, std::move(arg));
       auto object = self.ivalue.toObject();
       object->setSlot(0, c10::IValue::make_capsule(classObj));
     };
@@ -443,7 +444,7 @@ c10::IValue make_custom_class(CtorArgs&&... args) {
 }
 
 // Alternative api for creating a torchbind class over torch::class_ this api is
-// preffered to prevent size regressions on Edge usecases. Must be used in
+// preferred to prevent size regressions on Edge usecases. Must be used in
 // conjunction with TORCH_SELECTIVE_CLASS macro aka
 // selective_class<foo>("foo_namespace", TORCH_SELECTIVE_CLASS("foo"))
 template <class CurClass>

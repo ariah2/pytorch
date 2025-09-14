@@ -2,10 +2,6 @@
 import torch
 import torch.distributed as dist
 from torch.autograd import Function
-
-# The two imports below are not always available depending on the
-# USE_DISTRIBUTED compile flag. Make sure they raise import error
-# if we're trying to use them.
 from torch.distributed import group, ReduceOp
 
 
@@ -443,7 +439,7 @@ class _AllReduce(Function):
     def forward(ctx, op, group, tensor):
         ctx.group = group
         ctx.op = op
-        tensor = tensor.clone()
+        tensor = tensor.clone(memory_format=torch.contiguous_format)
         dist.all_reduce(tensor, op=op, group=group)
         return tensor
 

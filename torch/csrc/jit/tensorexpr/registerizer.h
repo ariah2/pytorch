@@ -186,7 +186,7 @@ class AccessInfo {
   bool firstUsageOverlapped_{false};
 
   // The cost in real ops that this access represents, to enable
-  // filtering accesses that wont save any loads or stores.
+  // filtering accesses that won't save any loads or stores.
   ExprPtr store_cost_;
   ExprPtr load_cost_;
 
@@ -342,9 +342,9 @@ class TORCH_API RegisterizerAnalysis : public IRVisitor {
     stmtStack_.pop_front();               \
   }
 
-  STMT_ON_STACK(AtomicAdd);
-  STMT_ON_STACK(Allocate);
-  STMT_ON_STACK(Free);
+  STMT_ON_STACK(AtomicAdd)
+  STMT_ON_STACK(Allocate)
+  STMT_ON_STACK(Free)
 
 #undef STMT_ON_STACK
 

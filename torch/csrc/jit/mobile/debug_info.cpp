@@ -76,7 +76,7 @@ std::pair<std::vector<StackEntry>, std::string> getStackTraceWithModuleHierarchy
 // This function construct stacktrace with module hierarchy
 // Module hierarchy will contain information about where in the
 // module hierarchy this source is. For example if conv2d op
-// exist in hierarcy A->B->C->Conv2d with type annotations of
+// exist in hierarchy A->B->C->Conv2d with type annotations of
 // A -> TopM, B->MyModule, C->SomeModule, then module hierarchy
 // will be TopM(A).MyModule(B).SomeModule(C).Conv2d(conv)
 // Source level stack information will be from model source code.
@@ -115,9 +115,9 @@ MobileDebugTable::MobileDebugTable(
     const std::shared_ptr<CompilationUnit>& cu) {
   ska::flat_hash_map<int64_t, SourceRange> source_range_map;
   const std::vector<std::string>& record_names = reader->getAllRecords();
-  const c10::string_view suffix(".debug_pkl");
+  constexpr std::string_view suffix(".debug_pkl");
   for (const auto& record_name : record_names) {
-    if (c10::string_view(record_name).ends_with(suffix)) {
+    if (c10::ends_with(std::string_view(record_name), suffix)) {
       auto [debug_data, debug_size] = reader->getRecord(record_name);
       auto ivalueTuple = jit::unpickle(
           reinterpret_cast<const char*>(debug_data.get()),

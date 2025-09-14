@@ -12,6 +12,7 @@
 #include <c10/macros/Export.h>
 #include <c10/util/MaybeOwned.h>
 #include <c10/util/intrusive_ptr.h>
+#include <limits>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -160,6 +161,7 @@ struct Capsule {
   _(Double)                  \
   _(ComplexDouble)           \
   _(Int)                     \
+  _(UInt)                    \
   _(SymInt)                  \
   _(SymFloat)                \
   _(SymBool)                 \
@@ -522,7 +524,7 @@ struct TORCH_API IValue final {
   }
   c10::intrusive_ptr<ivalue::Tuple> toTuple() &&;
   c10::intrusive_ptr<ivalue::Tuple> toTuple() const&;
-  C10_NODISCARD ivalue::Tuple& toTupleRef() const;
+  [[nodiscard]] ivalue::Tuple& toTupleRef() const;
 
   // Double
   IValue(double d) : tag(Tag::Double) {
@@ -653,6 +655,29 @@ struct TORCH_API IValue final {
     }
   }
 
+  // Unsigned
+  IValue(uint64_t u) : tag( u <= std::numeric_limits<int64_t>::max() ? Tag::Int : Tag::UInt) {
+    payload.u.as_uint = u;
+  }
+
+
+  // See Note [Meaning of HAS_u]
+  // IValue type model closely follows that of c10::Scalar
+  // Where all integers are upcast to 64-bit representation, and `as_int` is used as default
+  // representation unless value could not be represented as signed int
+  bool isUnsigned() const {
+    return Tag::UInt == tag || (Tag::Int == tag && payload.u.as_int >= 0);
+  }
+
+  uint64_t toUInt() const {
+    if (isUnsigned()) {
+      return payload.u.as_uint;
+    } else {
+      TORCH_INTERNAL_ASSERT(0, "expected unsigned int");
+    }
+  }
+
+
   // Bool
   IValue(bool b) : tag(Tag::Bool) {
 #if defined(__clang__) && defined(__x86_64__)
@@ -683,6 +708,8 @@ struct TORCH_API IValue final {
   c10::List<int64_t> toIntList() &&;
   c10::List<int64_t> toIntList() const&;
   std::vector<int64_t> toIntVector() const;
+  c10::List<c10::SymInt> toSymIntList() &&;
+  c10::List<c10::SymInt> toSymIntList() const&;
   std::vector<c10::SymInt> toSymIntVector() const;
   at::DimVector toDimVector() const;
 
@@ -690,7 +717,7 @@ struct TORCH_API IValue final {
   IValue(c10::intrusive_ptr<ivalue::ConstantString> v);
   IValue(std::string v);
   IValue(const char* v) : IValue(std::string(v)) {}
-  IValue(c10::string_view v) : IValue(std::string(v)){};
+  IValue(std::string_view v) : IValue(std::string(v)){}
   bool isString() const {
     return Tag::String == tag;
   }
@@ -699,7 +726,7 @@ struct TORCH_API IValue final {
   const std::string& toStringRef() const;
   std::optional<std::reference_wrapper<const std::string>> toOptionalStringRef()
       const;
-  c10::string_view toStringView() const;
+  std::string_view toStringView() const;
 
   // DoubleList
   bool isDoubleList() const;
@@ -891,8 +918,14 @@ struct TORCH_API IValue final {
     } else {
       TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
           s.isIntegral(false), "Unknown type in Scalar");
-      tag = Tag::Int;
-      payload.u.as_int = s.toLong();
+      if (s.isUnsigned()) {
+        const auto val = s.toUInt64();
+        payload.u.as_uint = val;
+        tag = val <= std::numeric_limits<int64_t>::max() ? Tag::Int : Tag::UInt;
+      } else {
+        payload.u.as_int = s.toLong();
+        tag = Tag::Int;
+      }
     }
   }
 
@@ -916,7 +949,9 @@ struct TORCH_API IValue final {
       return toSymFloat();
     else if (isSymBool())
       return toSymBool();
-    throw std::runtime_error("IValue is not a Scalar");
+    else if (isUnsigned())
+      return toUInt();
+    TORCH_CHECK(false, "IValue is not a Scalar");
   }
 
   // Device
@@ -1163,7 +1198,7 @@ struct TORCH_API IValue final {
   // this value different (e.g. using NaN boxing), and this would make it more
   // costly to determine the tag for all types vs just determining if something
   // is a particular type. Instead we want clients to use the `isX` methods when
-  // possible. If for perf. reasons you really, absolutely, must have a jump
+  // possible. If for performance reasons you really, absolutely, must have a jump
   // table, then we can revisit this.
   enum class Tag : uint32_t {
 #define DEFINE_TAG(x) x,
@@ -1244,6 +1279,8 @@ struct TORCH_API IValue final {
       case Tag::ComplexDouble:
         return true;
       case Tag::Int:
+        return false;
+      case Tag::UInt:
         return false;
       case Tag::SymInt:
         return true;
@@ -1341,6 +1378,8 @@ struct TORCH_API IValue final {
     union TriviallyCopyablePayload {
       TriviallyCopyablePayload() : as_int(0) {}
       int64_t as_int;
+      // See Note [Meaning of HAS_u]
+      uint64_t as_uint;
       double as_double;
       bool as_bool;
       // Invariant: never nullptr; null state is represented as
@@ -1352,8 +1391,14 @@ struct TORCH_API IValue final {
         DeviceIndex index;
       } as_device;
     } u;
+    static_assert(std::is_trivially_copyable_v<TriviallyCopyablePayload>);
     at::Tensor as_tensor;
     Payload() : u() {}
+    Payload(const Payload&) = delete;
+    Payload(Payload&&) = delete;
+    Payload& operator=(const Payload&) = delete;
+    Payload& operator=(Payload&&) = delete;
+    // NOLINTNEXTLINE(modernize-use-equals-default)
     ~Payload() {}
   };
 
@@ -1530,21 +1575,21 @@ struct WeakOrStrongCompilationUnit {
       : strong_ptr_(std::nullopt), weak_ptr_(std::move(weak_cu)) {}
 
   std::shared_ptr<torch::jit::CompilationUnit> getStrongRefOrThrow() const {
-    TORCH_INTERNAL_ASSERT(strong_ptr_ != std::nullopt);
+    TORCH_INTERNAL_ASSERT(strong_ptr_.has_value());
     return *strong_ptr_;
   }
 
   std::weak_ptr<torch::jit::CompilationUnit> getWeakRefOrThrow() const {
-    TORCH_INTERNAL_ASSERT(weak_ptr_ != std::nullopt);
+    TORCH_INTERNAL_ASSERT(weak_ptr_.has_value());
     return *weak_ptr_;
   }
 
   bool holdingStrongRef() const {
-    return strong_ptr_ != std::nullopt;
+    return strong_ptr_.has_value();
   }
 
   bool holdingEmptyStrongRef() const {
-    return holdingStrongRef() && *strong_ptr_ == nullptr;
+    return strong_ptr_ == nullptr;
   }
 
   std::optional<std::shared_ptr<torch::jit::CompilationUnit>> strong_ptr_;

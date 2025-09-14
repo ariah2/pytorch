@@ -19,13 +19,15 @@
 
 namespace py = pybind11;
 
+#define IS_PYBIND_2_13_PLUS PYBIND11_VERSION_HEX >= 0x020D0000
+
 // This makes intrusive_ptr to be available as a custom pybind11 holder type,
 // see
 // https://pybind11.readthedocs.io/en/stable/advanced/smart_ptrs.html#custom-smart-pointers
-PYBIND11_DECLARE_HOLDER_TYPE(T, c10::intrusive_ptr<T>, true);
+PYBIND11_DECLARE_HOLDER_TYPE(T, c10::intrusive_ptr<T>, true)
 
-PYBIND11_DECLARE_HOLDER_TYPE(T, c10::SingletonOrSharedTypePtr<T>);
-PYBIND11_DECLARE_HOLDER_TYPE(T, c10::SingletonTypePtr<T>, true);
+PYBIND11_DECLARE_HOLDER_TYPE(T, c10::SingletonOrSharedTypePtr<T>)
+PYBIND11_DECLARE_HOLDER_TYPE(T, c10::SingletonTypePtr<T>, true)
 
 namespace pybind11::detail {
 
@@ -337,7 +339,7 @@ struct type_caster<c10::complex<T>> {
   bool load(handle src, bool) {
     PyObject* obj = src.ptr();
 
-    // Refered from `THPUtils_unpackComplexDouble`
+    // Referred from `THPUtils_unpackComplexDouble`
     Py_complex py_complex = PyComplex_AsCComplex(obj);
     if (py_complex.real == -1.0 && PyErr_Occurred()) {
       return false;

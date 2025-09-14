@@ -6,12 +6,9 @@
 #include <torch/csrc/jit/frontend/error_report.h>
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
-#include <torch/csrc/jit/passes/onnx/helper.h>
 #include <torch/csrc/jit/passes/onnx/pattern_conversion/pattern_encapsulation.h>
 
 #include <c10/util/irange.h>
-
-#include <limits>
 
 namespace torch::jit {
 
@@ -194,8 +191,7 @@ std::pair<Value*, Value*> PrepareCopyForONNX(Node* node) {
   expanded_value->node()->copyMetadata(node);
 
   auto index_put = graph->insert(
-      aten::index_put_,
-      {node->input(0), dummy_list, expanded_value, node->input(2)});
+      aten::index_put_, {node->input(0), dummy_list, expanded_value});
   index_put->node()->copyMetadata(node);
   index_put->copyMetadata(node->output());
   node->output()->replaceAllUsesWith(index_put);
@@ -345,7 +341,7 @@ static void PrepareForRemoveMutations(MutationRemover& mr, Block* b) {
         auto it =
             std::find(node->inputs().begin(), node->inputs().end(), input);
         if (it != node->inputs().end()) {
-          int index = std::distance(node->inputs().begin(), it);
+          auto index = std::distance(node->inputs().begin(), it);
           TORCH_WARN(
               "ONNX Preprocess - Removing mutation from node ",
               node->kind().toQualString(),
@@ -655,7 +651,7 @@ void InplaceConverter::gatherAttrNameInitialValueMap(
     auto moduleNames =
         findSubModuleAttr(n->inputs().at(0), name, attrModule, graph_);
 
-    std::string fullName("");
+    std::string fullName;
     for (auto& name : moduleNames) {
       fullName += name + '.';
     }

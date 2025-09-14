@@ -9,9 +9,7 @@
 
 #include <utility>
 
-namespace torch {
-namespace jit {
-namespace SubgraphUtils {
+namespace torch::jit::SubgraphUtils {
 namespace {
 
 bool hasSubgraph(Node* n) {
@@ -64,7 +62,7 @@ struct ValueMapper {
     auto new_outputs = merged_node->outputs();
     for (Value* v : new_outputs) {
       auto maybe_last_use = firstOrLastUse(v, /*find_first*/ false);
-      // if it doesnt have a use it shouldnt have been added as output
+      // if it doesn't have a use it shouldn't have been added as output
       TORCH_INTERNAL_ASSERT(maybe_last_use);
       const Use last_use = *maybe_last_use;
 
@@ -133,7 +131,6 @@ void mergeSubgraph(Node* mergeTo, Node* mergeFrom) {
   }
   ++it;
 
-  std::vector<Node*> merged_nodes;
   while (it != end_it) {
     Node* node = *it;
     ++it;
@@ -634,6 +631,4 @@ std::string generateNameForGraph(
   return truncateStrWithHash(graph_name.str(), maxlen);
 }
 
-} // namespace SubgraphUtils
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::SubgraphUtils

@@ -145,17 +145,39 @@ struct TensorQueue : torch::CustomClassHolder {
     }
   }
 
-  c10::Dict<std::string, at::Tensor> serialize() const {
-    c10::Dict<std::string, at::Tensor> dict;
-    dict.insert(std::string("init_tensor"), init_tensor_);
-    const std::string key = "queue";
-    dict.insert(
-        key + "/size", torch::tensor(static_cast<int64_t>(queue_.size())));
-    for (const auto index : c10::irange(queue_.size())) {
-      dict.insert(key + "/" + std::to_string(index), queue_[index]);
-    }
-    return dict;
+  std::tuple<
+      std::tuple<std::string, at::Tensor>,
+      std::tuple<std::string, std::vector<at::Tensor>>>
+  serialize() {
+    return std::tuple(
+        std::tuple("init_tensor", this->init_tensor_.clone()),
+        std::tuple("queue", this->clone_queue()));
   }
+
+  static c10::intrusive_ptr<TensorQueue> deserialize(
+      std::tuple<
+          std::tuple<std::string, at::Tensor>,
+          std::tuple<std::string, std::vector<at::Tensor>>> flattened) {
+    TORCH_CHECK(std::tuple_size<decltype(flattened)>::value == 2);
+
+    auto init_tensor_tuple = std::get<0>(flattened);
+    TORCH_CHECK(std::tuple_size<decltype(init_tensor_tuple)>::value == 2);
+    TORCH_CHECK(std::get<0>(init_tensor_tuple) == std::string("init_tensor"));
+
+    c10::intrusive_ptr<TensorQueue> queue =
+        c10::make_intrusive<TensorQueue>(std::get<1>(init_tensor_tuple));
+
+    auto queue_tuple = std::get<1>(flattened);
+    TORCH_CHECK(std::tuple_size<decltype(queue_tuple)>::value == 2);
+    TORCH_CHECK(std::get<0>(queue_tuple) == std::string("queue"));
+
+    for (auto& value : std::get<1>(queue_tuple)) {
+      queue->push(value);
+    }
+
+    return queue;
+  }
+
   // Push the element to the rear of queue.
   // Lock is added for thread safe.
   void push(at::Tensor x) {
@@ -354,7 +376,7 @@ struct ElementwiseInterpreter : torch::CustomClassHolder {
   // for more info.
 
   // This is the type we will use to marshall information on disk during
-  // ser/de. It is a simple tuple composed of primitive types and simple
+  // Ser/De. It is a simple tuple composed of primitive types and simple
   // collection types like vector, optional, and dict.
   using SerializationType = std::tuple<
       std::vector<std::string> /*input_names_*/,
@@ -399,7 +421,9 @@ struct FlattenWithTensorOp : public torch::CustomClassHolder {
   explicit FlattenWithTensorOp(at::Tensor t) : t_(t) {}
 
   at::Tensor get() {
-    return t_;
+    // Need to return a copy of the tensor, otherwise the tensor will be
+    // aliased with a tensor that may be modified by the user or backend.
+    return t_.clone();
   }
 
   std::tuple<std::tuple<std::string, at::Tensor>> __obj_flatten__() {
@@ -415,7 +439,9 @@ struct ContainsTensor : public torch::CustomClassHolder {
   explicit ContainsTensor(at::Tensor t) : t_(t) {}
 
   at::Tensor get() {
-    return t_;
+    // Need to return a copy of the tensor, otherwise the tensor will be
+    // aliased with a tensor that may be modified by the user or backend.
+    return t_.clone();
   }
 
   std::tuple<std::tuple<std::string, at::Tensor>> __obj_flatten__() {
@@ -481,7 +507,15 @@ TORCH_LIBRARY(_TorchScriptTesting, m) {
   m.class_<FlattenWithTensorOp>("_FlattenWithTensorOp")
       .def(torch::init<at::Tensor>())
       .def("get", &FlattenWithTensorOp::get)
-      .def("__obj_flatten__", &FlattenWithTensorOp::__obj_flatten__);
+      .def("__obj_flatten__", &FlattenWithTensorOp::__obj_flatten__)
+      .def_pickle(
+          // __getstate__
+          [](const c10::intrusive_ptr<FlattenWithTensorOp>& self)
+              -> at::Tensor { return self->get(); },
+          // __setstate__
+          [](at::Tensor data) -> c10::intrusive_ptr<FlattenWithTensorOp> {
+            return c10::make_intrusive<FlattenWithTensorOp>(std::move(data));
+          });
 
   m.class_<ConstantTensorContainer>("_ConstantTensorContainer")
       .def(torch::init<at::Tensor>())
@@ -496,6 +530,8 @@ TORCH_LIBRARY(_TorchScriptTesting, m) {
       "takes_foo_list_return(__torch__.torch.classes._TorchScriptTesting._Foo foo, Tensor x) -> Tensor[]");
   m.def(
       "takes_foo_tuple_return(__torch__.torch.classes._TorchScriptTesting._Foo foo, Tensor x) -> (Tensor, Tensor)");
+  m.def(
+      "takes_foo_tensor_return(__torch__.torch.classes._TorchScriptTesting._Foo foo, Tensor x) -> Tensor");
 
   m.class_<FooGetterSetter>("_FooGetterSetter")
       .def(torch::init<int64_t, int64_t>())
@@ -639,13 +675,17 @@ TORCH_LIBRARY(_TorchScriptTesting, m) {
       .def_pickle(
           // __getstate__
           [](const c10::intrusive_ptr<TensorQueue>& self)
-              -> c10::Dict<std::string, at::Tensor> {
+              -> std::tuple<
+                  std::tuple<std::string, at::Tensor>,
+                  std::tuple<std::string, std::vector<at::Tensor>>> {
             return self->serialize();
           },
           // __setstate__
-          [](c10::Dict<std::string, at::Tensor> data)
+          [](std::tuple<
+              std::tuple<std::string, at::Tensor>,
+              std::tuple<std::string, std::vector<at::Tensor>>> data)
               -> c10::intrusive_ptr<TensorQueue> {
-            return c10::make_intrusive<TensorQueue>(std::move(data));
+            return TensorQueue::deserialize(data);
           });
 }
 
@@ -675,8 +715,13 @@ std::tuple<at::Tensor, at::Tensor> takes_foo_tuple_return(
   return std::make_tuple(a, b);
 }
 
+at::Tensor takes_foo_tensor_return(c10::intrusive_ptr<Foo> foo, at::Tensor x) {
+  return at::ones({foo->x, foo->y}, at::device(at::kCPU).dtype(at::kInt));
+}
+
 void queue_push(c10::intrusive_ptr<TensorQueue> tq, at::Tensor x) {
-  tq->push(x);
+  // clone the tensor to avoid aliasing
+  tq->push(x.clone());
 }
 
 at::Tensor queue_pop(c10::intrusive_ptr<TensorQueue> tq) {
@@ -706,6 +751,12 @@ TORCH_LIBRARY_IMPL(_TorchScriptTesting, CPU, m) {
   m.impl("queue_push", queue_push);
   m.impl("queue_pop", queue_pop);
   m.impl("queue_size", queue_size);
+  m.impl("takes_foo_tensor_return", takes_foo_tensor_return);
+}
+
+TORCH_LIBRARY_IMPL(_TorchScriptTesting, CUDA, m) {
+  m.impl("queue_push", queue_push);
+  m.impl("queue_pop", queue_pop);
 }
 
 TORCH_LIBRARY_IMPL(_TorchScriptTesting, Meta, m) {

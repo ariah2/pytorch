@@ -7,8 +7,7 @@
 
 #include <atomic>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 /*
  *  BackendDebugHandleManager is responsible for issuing debug handles to
@@ -19,7 +18,7 @@ namespace jit {
  *  Effectively debug handles are something that is given to backend and later
  *  when an exception occurs in the backend, backend can tell, using debug
  *  handle, that an exception occurred here. Then the runtime can generate
- *  callstack correspoding to the exception.
+ *  callstack corresponding to the exception.
  *  There are two parts to BackendDebugHandleManager:
  *  1. static std::atomic debug_handle
  *  2. Map of [debug-handle, DebugInfoTuple]
@@ -136,5 +135,4 @@ class TORCH_API BackendDebugInfoRecorder {
   BackendDebugInfoMapType handles_to_inlined_callstack_ptrs_;
 };
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

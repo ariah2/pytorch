@@ -82,6 +82,8 @@ struct ConcretePyInterpreterVTable final
 
   bool is_contiguous(const c10::TensorImpl* self, at::MemoryFormat)
       const override;
+  c10::SymBool sym_is_contiguous(const c10::TensorImpl* self, at::MemoryFormat)
+      const override;
   bool is_strides_like(const c10::TensorImpl* self, at::MemoryFormat)
       const override;
   bool is_non_overlapping_and_dense(const c10::TensorImpl* self) const override;
@@ -159,6 +161,10 @@ class PyInterpreterHolder {
         is_main_interpreter_(
             at::impl::PythonOpRegistrationTrampoline::registerInterpreter(
                 impl_)) {}
+  PyInterpreterHolder(const PyInterpreterHolder&) = delete;
+  PyInterpreterHolder(PyInterpreterHolder&&) = delete;
+  PyInterpreterHolder& operator=(const PyInterpreterHolder&) = delete;
+  PyInterpreterHolder& operator=(PyInterpreterHolder&&) = delete;
   // NB: intentionally leaks the PyInterpreter, as there may still be
   // references to it that are live, living in objects that aren't being
   // destructed while Python is being cleaned up.
@@ -198,8 +204,7 @@ py::object torchDispatchFromTensorImpl(
       c10::intrusive_ptr<c10::TensorImpl, c10::UndefinedTensorImpl>::
           // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
       unsafe_reclaim_from_nonowning(const_cast<c10::TensorImpl*>(self)));
-  auto self_p =
-      py::reinterpret_steal<py::object>(THPVariable_Wrap(std::move(self_t)));
+  auto self_p = py::reinterpret_steal<py::object>(THPVariable_Wrap(self_t));
   // NB: this may not be a python tensor if you got here from a mode!
   // TORCH_INTERNAL_ASSERT(isPythonTensor(self_t));
   append_overloaded_tensor(&overloaded_args, self_p.ptr());
@@ -274,14 +279,14 @@ void ConcretePyInterpreterVTable::decref(PyObject* pyobj, bool has_pyobj_slot)
     }
   }
   Py_DECREF(pyobj);
-};
+}
 
 void ConcretePyInterpreterVTable::incref(PyObject* pyobj) const {
   if (!Py_IsInitialized())
     return;
   pybind11::gil_scoped_acquire gil;
   Py_INCREF(pyobj);
-};
+}
 
 bool isPythonTensor(const at::Tensor& tensor) {
   return tensor.unsafeGetTensorImpl()->key_set().has(c10::DispatchKey::Python);
@@ -367,9 +372,12 @@ void ConcretePyInterpreterVTable::python_dispatcher(
   }
 
   c10::DispatchKey k = ks.highestPriorityTypeId();
-  // TODO: allow this to be non-owning
-  auto handler = py::reinterpret_borrow<py::object>(
-      PyDict_GetItem(cache.ptr(), py::cast(k).ptr()));
+  PyObject* raw_handler = nullptr;
+  if (PyDict_GetItemRef(cache.ptr(), py::cast(k).ptr(), &raw_handler) < 0) {
+    // There was an error that is not missing key (which would return 0)
+    throw python_error();
+  }
+  auto handler = py::reinterpret_steal<py::object>(raw_handler);
   if (handler.ptr() == nullptr) {
     // Slow path
     handler = torch_api_function_overload.attr("_get_dispatch")(k);
@@ -468,6 +476,33 @@ bool ConcretePyInterpreterVTable::is_contiguous(
       ", expected bool");
 
   return PyObject_IsTrue(out.ptr());
+}
+
+c10::SymBool ConcretePyInterpreterVTable::sym_is_contiguous(
+    const c10::TensorImpl* self,
+    at::MemoryFormat memory_format) const {
+  pybind11::gil_scoped_acquire gil;
+  at::impl::MaybeSetTLSOnEntryGuard guard;
+
+  py::object out;
+  out = torchDispatchFromTensorImpl(
+      self,
+      "sym_is_contiguous",
+      py::module::import("torch")
+          .attr("ops")
+          .attr("aten")
+          .attr("sym_is_contiguous")
+          .attr("default")
+          .ptr(),
+      "torch.ops.aten",
+      {py::cast(memory_format)});
+
+  if (out.is_none()) {
+    return self->sym_is_contiguous_default(memory_format);
+  }
+
+  return torch::is_symbool(out) ? out.cast<c10::SymBool>()
+                                : c10::SymBool{py::cast<bool>(out)};
 }
 
 bool ConcretePyInterpreterVTable::is_strides_like(
@@ -580,7 +615,7 @@ static void set_tensor_attr_with_capsule(
     py::capsule& capsule,
     const char* attr_name) {
   std::optional<PyObject*> mb_obj = tensor->pyobj_slot()->check_pyobj(
-      getPyInterpreter(), /*ignore_hermetic_tls=*/false);
+      /*ignore_hermetic_tls=*/false);
   TORCH_CHECK(
       mb_obj.has_value(), "Tensor subclass's PyInterpreter has no value");
   auto obj = mb_obj.value();
@@ -629,7 +664,7 @@ static c10::ArrayRef<T> get_set_cached_attr(
   // is also to <=5 elements, we don't need to reallocate.
   // Note: I tried removing this optimization and tripped ASAN
   // in a batchnorm kernel here:
-  // https://pipelinesghubeus21.actions.githubusercontent.com/mBh68xKhi8LyM7tp3vECvYXNFvuV4gyVGgmYCteuEZP9JH92QN/_apis/pipelines/1/runs/3373307/signedlogcontent/790?urlExpires=2023-09-15T21%3A13%3A51.4327798Z&urlSigningMethod=HMACV1&urlSignature=tDeX7ZqaARVU5NNwyr5yYqqkWq3A2j4z8FFdqYwGr0Q%3D
+  // https://pipelinesghubeus21.actions.githubusercontent.com/mBh68xKhi8LyM7tp3vECvYXNFvuV4gyVGgmYCteuEZP9JH92QN/_apis/pipelines/1/runs/3373307/signedlogcontent/790?urlExpires=2023-09-15T21%3A13%3A51.4327798Z&urlSigningMethod=HMACV1&urlSignature=tDeX7ZqaARVU5NNwyr5yYqqkWq3A2j4z8FFdqYwGr0Q%3D@lint-ignore
   // We should fix this instead.
   bool needs_resize = false;
   // We need to resize if:
@@ -937,8 +972,7 @@ void ConcretePyInterpreterVTable::reset_backward_hooks(
       Tensor(c10::intrusive_ptr<c10::TensorImpl, c10::UndefinedTensorImpl>::
                  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
              unsafe_reclaim_from_nonowning(const_cast<c10::TensorImpl*>(self)));
-  auto self_p =
-      py::reinterpret_steal<py::object>(THPVariable_Wrap(std::move(self_t)));
+  auto self_p = py::reinterpret_steal<py::object>(THPVariable_Wrap(self_t));
   PyObject_SetAttrString(self_p.ptr(), "_backward_hooks", Py_None);
   END_HANDLE_TH_ERRORS_PYBIND
 }
@@ -981,8 +1015,4 @@ py::handle getTorchApiFunction(const c10::OperatorHandle& op) {
 
 c10::impl::PyInterpreter* getPyInterpreter() {
   return torch::detail::self_interpreter.get();
-}
-
-bool isMainPyInterpreter() {
-  return torch::detail::self_interpreter.is_main_interpreter();
 }

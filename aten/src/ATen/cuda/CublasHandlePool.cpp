@@ -23,6 +23,9 @@
  * To work around this difference in behavior, a separate handle pool is available for ROCm builds.
  * For CUDA builds, getCurrentCUDABlasLtHandle will alias for getCurrentCUDABlasHandle,
  * whereas for ROCm builds, it is a distinct function.
+ *
+ * The workspace pools are separate for ROCm. On CUDA, the env var
+ * TORCH_CUBLASLT_UNIFIED_WORKSPACE can be used to opt-in to unifying the workspace pools.
  */
 
 namespace at::cuda {
@@ -48,12 +51,40 @@ void destroyCublasLtHandle(cublasLtHandle_t handle) {
 }
 
 using CuBlasLtPoolType = DeviceThreadHandlePool<cublasLtHandle_t, createCublasLtHandle, destroyCublasLtHandle>;
-#endif
 
-std::map<std::tuple<void *, void *>, at::DataPtr>& cublas_handle_stream_to_workspace() {
-  static auto& instance = *new std::map<std::tuple<void *, void *>, at::DataPtr>;
-  return instance;
+// ugly hack until hipblasSetWorkspace exists
+#include <rocblas/rocblas.h>
+
+static hipblasStatus_t rocBLASStatusToHIPStatus(rocblas_status error) {
+    switch(error) {
+    case rocblas_status_size_unchanged:
+    case rocblas_status_size_increased:
+    case rocblas_status_success:
+        return HIPBLAS_STATUS_SUCCESS;
+    case rocblas_status_invalid_handle:
+        return HIPBLAS_STATUS_NOT_INITIALIZED;
+    case rocblas_status_not_implemented:
+        return HIPBLAS_STATUS_NOT_SUPPORTED;
+    case rocblas_status_invalid_pointer:
+    case rocblas_status_invalid_size:
+    case rocblas_status_invalid_value:
+        return HIPBLAS_STATUS_INVALID_VALUE;
+    case rocblas_status_memory_error:
+        return HIPBLAS_STATUS_ALLOC_FAILED;
+    case rocblas_status_internal_error:
+        return HIPBLAS_STATUS_INTERNAL_ERROR;
+    }
+    TORCH_CHECK(false, "HIPBLAS_STATUS_INVALID_ENUM");
 }
+
+static hipblasStatus_t hipblasSetWorkspace_replacement(hipblasHandle_t handle, void* addr, size_t size) {
+    return rocBLASStatusToHIPStatus(rocblas_set_workspace((rocblas_handle)handle, addr, size));
+}
+
+// hipify mappings file correctly maps this but the function doesn't exist yet
+#define hipblasSetWorkspace hipblasSetWorkspace_replacement
+
+#endif
 
 void createCublasHandle(cublasHandle_t *handle) {
   TORCH_CUDABLAS_CHECK(cublasCreate(handle));
@@ -76,22 +107,44 @@ using CuBlasPoolType = DeviceThreadHandlePool<cublasHandle_t, createCublasHandle
 
 } // namespace
 
+std::map<std::tuple<void *, void *>, at::DataPtr>& cublas_handle_stream_to_workspace() {
+  static auto& instance = *new std::map<std::tuple<void *, void *>, at::DataPtr>;
+  return instance;
+}
+
+std::map<std::tuple<void *, void *>, at::DataPtr>& cublaslt_handle_stream_to_workspace() {
+  static auto& instance = *new std::map<std::tuple<void *, void *>, at::DataPtr>;
+  return instance;
+}
+
 void clearCublasWorkspaces() {
-  #if !defined(USE_ROCM)
-      cublas_handle_stream_to_workspace().clear();
-  #endif
+  cublas_handle_stream_to_workspace().clear();
+  cublaslt_handle_stream_to_workspace().clear();
 }
 
 size_t parseChosenWorkspaceSize() {
-  const char * val = getenv("CUBLAS_WORKSPACE_CONFIG");
+  auto val = c10::utils::get_env("CUBLAS_WORKSPACE_CONFIG");
+#ifdef USE_ROCM
+  if (!val) {
+    val = c10::utils::get_env("HIPBLAS_WORKSPACE_CONFIG");
+  }
+  if (!val) {
+    // for extra convenience
+    val = c10::utils::get_env("ROCBLAS_WORKSPACE_CONFIG");
+  }
+  /* 32MiB default, 128MiB for gfx94x/gfx95x */
+  const bool gfx94_95 = at::detail::getCUDAHooks().isGPUArch({"gfx94", "gfx95"});
+  const size_t default_size = gfx94_95 ? 1024 * 128 * 1024 : 1024 * 32 * 1024;
+#else
   /* :4096:2:16:8 default, 32MiB for Hopper */
   cudaDeviceProp* properties = at::cuda::getCurrentDeviceProperties();
   const bool sm90 = properties != nullptr && properties->major == 9 && properties->minor == 0;
   const size_t default_size = sm90 ? 4096 * 8 * 1024 : 4096 * 1024 * 2 + 16 * 1024 * 8;
+#endif
 
   if (val) {
     size_t total_size = 0;
-    const std::string config(val);
+    const std::string& config(val.value());
     std::regex exp(":([0-9]+):([0-9]+)");
     std::sregex_iterator next(config.begin(), config.end(), exp);
     std::sregex_iterator end;
@@ -113,13 +166,95 @@ size_t parseChosenWorkspaceSize() {
   }
 }
 
+size_t parseCUDABlasLtWorkspaceSize() {
+  auto val = c10::utils::get_env("CUBLASLT_WORKSPACE_SIZE");
+#ifdef USE_ROCM
+  if (!val.has_value()) {
+    // accept either env var
+    val = c10::utils::get_env("HIPBLASLT_WORKSPACE_SIZE");
+  }
+  size_t workspace_size = 76*1024; /* Use 76 MB for hipBLASLt */
+#else
+  size_t workspace_size = 1024; /* default size in KiB according to #73328 */
+#endif
+
+  if (val.has_value()) {
+    try {
+      workspace_size = std::stoi(val.value());
+    } catch (std::invalid_argument const&) {
+      TORCH_WARN(
+          "invalid CUBLASLT_WORKSPACE_SIZE,",
+          " using default workspace size of ",
+          workspace_size,
+          " KiB.");
+    } catch (std::out_of_range const&) {
+      TORCH_WARN(
+          "CUBLASLT_WORKSPACE_SIZE out of range,",
+          " using default workspace size of ",
+          workspace_size,
+          " KiB.");
+    }
+  }
+  return workspace_size * 1024;
+}
+
 size_t getChosenWorkspaceSize() {
   size_t pool_size = parseChosenWorkspaceSize();
   return pool_size;
 }
 
+#define TORCH_CUBLASLT_UNIFIED_WORKSPACE "TORCH_CUBLASLT_UNIFIED_WORKSPACE"
+
+size_t getCUDABlasLtWorkspaceSize() {
+  size_t pool_size = parseCUDABlasLtWorkspaceSize();
+#ifndef USE_ROCM
+  static bool unified = c10::utils::check_env(TORCH_CUBLASLT_UNIFIED_WORKSPACE) == true;
+  if (unified) {
+    auto cublasWorkspaceSize = getChosenWorkspaceSize();
+    if (cublasWorkspaceSize < pool_size) {
+      TORCH_WARN_ONCE("Requested unified CUBLASLT workspace size of ", pool_size,
+                      " bytes exceeds CUBLAS workspace size of ", cublasWorkspaceSize,
+                      " bytes. Please increase CUBLAS workspace size",
+                      " via CUBLAS_WORKSPACE_CONFIG or decrease requested"
+                      " CUBLASLT_WORKSPACE_SIZE. Otherwise CUBLASLT workspace"
+                      " size will be limited to the CUBLAS workspace size.");
+      pool_size = cublasWorkspaceSize;
+    }
+  }
+#endif
+  return pool_size;
+}
+
 at::DataPtr getNewWorkspace() {
   return c10::cuda::CUDACachingAllocator::get()->allocate(getChosenWorkspaceSize());
+}
+
+at::DataPtr getNewCUDABlasLtWorkspace() {
+  return c10::cuda::CUDACachingAllocator::get()->allocate(getCUDABlasLtWorkspaceSize());
+}
+
+void* getCUDABlasLtWorkspace() {
+#ifndef USE_ROCM
+  static bool unified = c10::utils::check_env(TORCH_CUBLASLT_UNIFIED_WORKSPACE) == true;
+  if (unified) {
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    auto stream = c10::cuda::getCurrentCUDAStream();
+    cudaStream_t _stream = stream;
+    auto key = std::make_tuple(static_cast<void *>(handle), static_cast<void *>(_stream));
+    auto workspace_it = at::cuda::cublas_handle_stream_to_workspace().find(key);
+    TORCH_INTERNAL_ASSERT(workspace_it != at::cuda::cublas_handle_stream_to_workspace().end());
+    return workspace_it->second.mutable_get();
+  }
+#endif
+  cublasLtHandle_t handle = getCurrentCUDABlasLtHandle();
+  auto stream = c10::cuda::getCurrentCUDAStream();
+  cudaStream_t _stream = stream;
+  auto key = std::make_tuple(static_cast<void *>(handle), static_cast<void *>(_stream));
+  auto workspace_it = cublaslt_handle_stream_to_workspace().find(key);
+  if (workspace_it == cublaslt_handle_stream_to_workspace().end()) {
+    workspace_it = cublaslt_handle_stream_to_workspace().insert(workspace_it, {key, getNewCUDABlasLtWorkspace()});
+  }
+  return workspace_it->second.mutable_get();
 }
 
 cublasHandle_t getCurrentCUDABlasHandle() {
@@ -156,7 +291,6 @@ cublasHandle_t getCurrentCUDABlasHandle() {
   auto handle = myPoolWindow->reserve(device);
   auto stream = c10::cuda::getCurrentCUDAStream();
   TORCH_CUDABLAS_CHECK(cublasSetStream(handle, stream));
-#if !defined(USE_ROCM)
   // We explicitly set the cublas workspace even though CUDA 12.2+ fixed the
   // issue where memory usage increased during graph capture.
   // original issue: https://github.com/pytorch/pytorch/pull/83461
@@ -171,10 +305,12 @@ cublasHandle_t getCurrentCUDABlasHandle() {
     workspace_it = cublas_handle_stream_to_workspace().insert(workspace_it, {key, getNewWorkspace()});
   }
   TORCH_CUDABLAS_CHECK(cublasSetWorkspace(handle, workspace_it->second.get(), getChosenWorkspaceSize()));
+#if !defined(USE_ROCM)
   // On CUDA >= 11, and architecture >= Ampere, cuBLAS can use TF32 to speedup
   // FP32 data type calculations based on the value of the allow_tf32 flag.
   // To enable TF32, set the math mode of the handle to CUBLAS_TF32_TENSOR_OP_MATH.
-  if (!NoTF32Guard::should_disable_tf32() && at::globalContext().allowTF32CuBLAS()) {
+  if (!NoTF32Guard::should_disable_tf32() &&
+      at::globalContext().float32Precision("cuda", "matmul") == "tf32") {
     TORCH_CUDABLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
   } else {
     TORCH_CUDABLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));

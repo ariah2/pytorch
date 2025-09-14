@@ -64,7 +64,7 @@ Tensor repeat_mps(const Tensor& self, IntArrayRef repeats) {
   auto outputDataType = getMPSDataType(result);
 
   @autoreleasepool {
-    string key = "repeat_mps:" + getTensorsStringKey(self) + ":" + getArrayRefString(repeats);
+    std::string key = "repeat_mps:" + getTensorsStringKey(self) + ":" + getArrayRefString(repeats);
     auto cachedGraph = LookUpOrCreateCachedGraph<CachedGraph>(key, [&](auto mpsGraph, auto newCachedGraph) {
       MPSGraphTensor* inputTensor = mpsGraphRankedPlaceHolder(mpsGraph, inputDataType, getMPSShape(expanded_tensor));
       MPSGraphTensor* outputTensor = [mpsGraph tileTensor:inputTensor withMultiplier:getMPSShape(repeats) name:nil];
@@ -85,21 +85,11 @@ Tensor repeat_mps(const Tensor& self, IntArrayRef repeats) {
   return result;
 }
 
-static mps::MetalShaderLibrary lib(R"METAL_REPEAT(
-kernel void repeat_interleave(constant {0}     * repeat_ptr                [[buffer(0)]],
-                              constant int64_t * cumsum_ptr                [[buffer(1)]],
-                              device {0}       * result_ptr                [[buffer(2)]],
-                              uint               threads_per_threadgroup   [[threads_per_threadgroup]],
-                              uint               tid                       [[thread_position_in_grid]]) {{
-  int64_t end = cumsum_ptr[tid];
-  {0} repeat = repeat_ptr[tid];
-  int64_t start = end - repeat;
-  for (uint j = start; j < end; j++) {{
-    result_ptr[j] = tid;
-  }}
-}}
-)METAL_REPEAT",
-                                   1);
+#ifndef PYTORCH_JIT_COMPILE_SHADERS
+static auto& lib = mps::MetalShaderLibrary::getBundledLibrary();
+#else
+#include <ATen/native/mps/Repeat_metallib.h>
+#endif
 
 template <typename index_t>
 void computeRepeatIndices(const index_t* repeat_ptr,
@@ -113,9 +103,9 @@ void computeRepeatIndices(const index_t* repeat_ptr,
   TORCH_CHECK(repeatBuffer && cumsumBuffer && resultBuffer);
 
   std::string scalar_type;
-  if (typeid(index_t) == typeid(int32_t)) {
+  if constexpr (std::is_same_v<index_t, int32_t>) {
     scalar_type = "int32_t";
-  } else if (typeid(index_t) == typeid(int64_t)) {
+  } else if constexpr (std::is_same_v<index_t, int64_t>) {
     scalar_type = "int64_t";
   } else {
     TORCH_CHECK(false, "repeat_interleave: unsupported indexing data type");
@@ -124,17 +114,14 @@ void computeRepeatIndices(const index_t* repeat_ptr,
   MPSStream* mpsStream = getCurrentMPSStream();
   dispatch_sync(mpsStream->queue(), ^() {
     @autoreleasepool {
-      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
-      id<MTLComputePipelineState> pipelineState = lib.getPipelineStateForFunc("repeat_interleave", {scalar_type});
+      auto computeEncoder = mpsStream->commandEncoder();
+      auto pipelineState = lib.getPipelineStateForFunc(fmt::format("repeat_interleave_{}", scalar_type));
 
       // this function call is a no-op if MPS Profiler is not enabled
       getMPSProfiler().beginProfileKernel(pipelineState, "repeat_interleave:" + scalar_type, false);
 
       [computeEncoder setComputePipelineState:pipelineState];
-      [computeEncoder setBuffer:repeatBuffer offset:0 atIndex:0];
-      [computeEncoder setBuffer:cumsumBuffer offset:0 atIndex:1];
-      [computeEncoder setBuffer:resultBuffer offset:0 atIndex:2];
-      mps::mtl_setBytes(computeEncoder, size, 3);
+      mps::mtl_setArgs(computeEncoder, repeatBuffer, cumsumBuffer, resultBuffer, size);
       mps::mtl_dispatch1DJob(computeEncoder, pipelineState, size);
 
       getMPSProfiler().endProfileKernel(pipelineState);
@@ -142,16 +129,8 @@ void computeRepeatIndices(const index_t* repeat_ptr,
   });
 }
 
-Tensor repeat_interleave_mps(const Tensor& repeat_, std::optional<int64_t> output_size) {
+Tensor repeat_interleave_mps(const Tensor& repeat, std::optional<int64_t> output_size) {
   Tensor output;
-  Tensor repeat = repeat_;
-  if (repeat.scalar_type() == kLong && !is_macos_13_or_newer(MacOSVersion::MACOS_VER_13_3_PLUS)) {
-    // #103810551: `repeat_interleave_common` uses cumsum to calculate the final shape of output,
-    // which currently doesn't support int64_t as input. Casting internally the indices to int32_t.
-    TORCH_WARN_ONCE(
-        "MPS: no support for int64 repeats mask, casting it to int32. Support has been added in macOS 13.3");
-    repeat = repeat.to(kInt);
-  }
   AT_DISPATCH_INDEX_TYPES(repeat.scalar_type(), "repeat_interleave_mps", [&]() {
     output = repeat_interleave_common<index_t, computeRepeatIndices<index_t>>(repeat, output_size);
   });

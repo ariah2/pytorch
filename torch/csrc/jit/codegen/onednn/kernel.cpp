@@ -4,10 +4,7 @@
 #include <ATen/core/functional.h>
 #include <torch/csrc/jit/jit_log.h>
 
-namespace torch {
-namespace jit {
-namespace fuser {
-namespace onednn {
+namespace torch::jit::fuser::onednn {
 
 using namespace dnnl::graph;
 using data_type = dnnl::graph::logical_tensor::data_type;
@@ -87,9 +84,9 @@ ArgSpecs LlgaKernel::initializeInputSpecs(const TensorArgs& inputs) {
   for (const auto i : c10::irange(nGraphInputs_)) {
     auto spec = ArgSpec(graph_->inputs()[i]).supplementTensorInfo(inputs[i]);
     initializedInputIds_.insert(spec.tid());
-    int64_t occurence = tensorIdToOccurence[spec.tid()];
-    inputSpecs.insert(inputSpecs.end(), occurence, spec);
-    runArgsIdx_.insert(runArgsIdx_.end(), occurence, i);
+    int64_t occurrence = tensorIdToOccurence[spec.tid()];
+    inputSpecs.insert(inputSpecs.end(), occurrence, spec);
+    runArgsIdx_.insert(runArgsIdx_.end(), occurrence, i);
   }
   GRAPH_DEBUG("Initializing constant input tensors");
   initializeConstantInputs();
@@ -129,7 +126,7 @@ std::tuple<RunArgs, RunArgs> LlgaKernel::prepareRunArgs(
   auto numInputs = runArgsIdx_.size();
   for (const auto i : c10::irange(numInputs)) {
     auto spec = inputSpecs_[i];
-    auto input = inputs[runArgsIdx_[i]];
+    const auto& input = inputs[runArgsIdx_[i]];
     runInputs.push_back(
         {spec.logical_tensor(), Engine::getEngine(), input.data_ptr()});
   }
@@ -293,7 +290,4 @@ void LlgaKernel::run(Stack& stack) {
 #endif
 }
 
-} // namespace onednn
-} // namespace fuser
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::fuser::onednn

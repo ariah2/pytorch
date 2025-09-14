@@ -195,7 +195,7 @@ class TORCH_API Tensor: public TensorBase {
   //
   // TODO: temporarily disabled
 
-  Tensor& operator=(const TensorBase& x) & {
+  Tensor& operator=(const TensorBase& x) & noexcept {
     impl_ = x.getIntrusivePtr();
     return *this;
   }
@@ -204,7 +204,7 @@ class TORCH_API Tensor: public TensorBase {
     return *this;
   }
 
-  Tensor& operator=(const Tensor &x) & {
+  Tensor& operator=(const Tensor &x) & noexcept {
     return operator=(static_cast<const TensorBase&>(x));
   }
   Tensor& operator=(Tensor &&x) & noexcept {
@@ -491,7 +491,7 @@ class TORCH_API Tensor: public TensorBase {
         "attribute won't be populated during autograd.backward(). If you indeed want the .grad "
         "field to be populated for a non-leaf Tensor, use .retain_grad() on the non-leaf Tensor. "
         "If you access the non-leaf Tensor by mistake, make sure you access the leaf Tensor "
-        "instead. See github.com/pytorch/pytorch/pull/30531 for more informations.");
+        "instead. See github.com/pytorch/pytorch/pull/30531 for more information.");
     }
     return maybe_grad;
   }
@@ -582,7 +582,7 @@ class TORCH_API Tensor: public TensorBase {
   template <typename T>
   using hook_return_void_t = std::enable_if_t<std::is_void<typename std::invoke_result_t<T&, Tensor>>::value, unsigned>;
   template <typename T>
-  using hook_return_var_t = std::enable_if_t<std::is_same<typename std::invoke_result_t<T&, Tensor>, Tensor>::value, unsigned>;
+  using hook_return_var_t = std::enable_if_t<std::is_same_v<typename std::invoke_result_t<T&, Tensor>, Tensor>, unsigned>;
 
   /// Registers a backward hook.
   ///

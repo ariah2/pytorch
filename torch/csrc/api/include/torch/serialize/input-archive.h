@@ -22,8 +22,7 @@ struct Module;
 } // namespace jit
 } // namespace torch
 
-namespace torch {
-namespace serialize {
+namespace torch::serialize {
 
 /// A recursive representation of tensors that can be deserialized from a file
 /// or stream. In most cases, users should not have to interact with this class,
@@ -102,7 +101,7 @@ class TORCH_API InputArchive final {
   std::vector<std::string> keys();
 
   /// Forwards all arguments to `read()`.
-  /// Useful for generic code that can be re-used for both `InputArchive` and
+  /// Useful for generic code that can be reused for both `InputArchive` and
   /// `OutputArchive` (where `operator()` forwards to `write()`).
   template <typename... Ts>
   void operator()(Ts&&... ts) {
@@ -113,5 +112,4 @@ class TORCH_API InputArchive final {
   jit::Module module_;
   std::string hierarchy_prefix_;
 };
-} // namespace serialize
-} // namespace torch
+} // namespace torch::serialize

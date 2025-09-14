@@ -10,7 +10,7 @@
 
 namespace at::mps {
 
-void MPSHooks::initMPS() const {
+void MPSHooks::init() const {
   C10_LOG_API_USAGE_ONCE("aten.init.mps");
   // TODO: initialize MPS devices and streams here
 }
@@ -22,13 +22,19 @@ bool MPSHooks::hasMPS() const {
 bool MPSHooks::isOnMacOSorNewer(unsigned major, unsigned minor) const {
   switch (major) {
     case 15:
-      if (minor > 0)
-        TORCH_WARN("Can't check whether running on 15.", minor, "+ returning one for 15.0+");
-      return is_macos_13_or_newer(MacOSVersion::MACOS_VER_15_0_PLUS);
+      switch (minor) {
+        case 0:
+          return is_macos_13_or_newer(MacOSVersion::MACOS_VER_15_0_PLUS);
+        case 1:
+          return is_macos_13_or_newer(MacOSVersion::MACOS_VER_15_1_PLUS);
+        default:
+          TORCH_WARN("Can't check whether running on 15.", minor, "+ returning one for 15.1+");
+          return is_macos_13_or_newer(MacOSVersion::MACOS_VER_15_1_PLUS);
+      }
     case 14:
       switch (minor) {
         case 0:
-          return is_macos_13_or_newer(MacOSVersion::MACOS_VER_14_0_PLUS);
+          return true;
         case 4:
           return is_macos_13_or_newer(MacOSVersion::MACOS_VER_14_4_PLUS);
         default:
@@ -36,19 +42,7 @@ bool MPSHooks::isOnMacOSorNewer(unsigned major, unsigned minor) const {
           return is_macos_13_or_newer(MacOSVersion::MACOS_VER_14_4_PLUS);
       }
     case 13:
-      switch (minor) {
-        case 0:
-          return true;
-        case 1:
-          return is_macos_13_or_newer(MacOSVersion::MACOS_VER_13_1_PLUS);
-        case 2:
-          return is_macos_13_or_newer(MacOSVersion::MACOS_VER_13_2_PLUS);
-        case 3:
-          return is_macos_13_or_newer(MacOSVersion::MACOS_VER_13_3_PLUS);
-        default:
-          TORCH_WARN("Can't check whether running on 13.", minor, "+ returning one for 13.3+");
-          return is_macos_13_or_newer(MacOSVersion::MACOS_VER_13_3_PLUS);
-      }
+      return true;
     default:
       TORCH_WARN("Checking for unexpected MacOS ", major, ".", minor, " returning false");
       return false;
@@ -59,8 +53,12 @@ Allocator* MPSHooks::getMPSDeviceAllocator() const {
   return at::mps::GetMPSAllocator();
 }
 
-const Generator& MPSHooks::getDefaultMPSGenerator() const {
+const Generator& MPSHooks::getDefaultGenerator([[maybe_unused]] DeviceIndex device_index) const {
   return at::mps::detail::getDefaultMPSGenerator();
+}
+
+Generator MPSHooks::getNewGenerator([[maybe_unused]] DeviceIndex device_index) const {
+  return make_generator<at::MPSGeneratorImpl>();
 }
 
 void MPSHooks::deviceSynchronize() const {
@@ -117,6 +115,10 @@ void MPSHooks::releaseEvent(uint32_t event_id) const {
 
 void MPSHooks::recordEvent(uint32_t event_id) const {
   at::mps::getMPSEventPool()->recordEvent(event_id, /* syncEvent*/ true);
+}
+
+Device MPSHooks::getDeviceFromPtr(void* data) const {
+  return at::mps::getDeviceFromPtr(data);
 }
 
 void MPSHooks::waitForEvent(uint32_t event_id) const {

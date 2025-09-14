@@ -93,8 +93,8 @@ On Ampere (and later) Nvidia GPUs, PyTorch can use TensorFloat32 (TF32) to speed
 When an operation is performed using TF32 tensor cores, only the first 10 bits of the input mantissa are read.
 This may reduce accuracy and produce surprising results (e.g., multiplying a matrix by the identity matrix may produce results that are different from the input).
 By default, TF32 tensor cores are disabled for matrix multiplications and enabled for convolutions, although most neural network workloads have the same convergence behavior when using TF32 as they have with fp32.
-We recommend enabling TF32 tensor cores for matrix multiplications with ``torch.backends.cuda.matmul.allow_tf32 = True`` if your network does not need full float32 precision.
-If your network needs full float32 precision for both matrix multiplications and convolutions, then TF32 tensor cores can also be disabled for convolutions with ``torch.backends.cudnn.allow_tf32 = False``.
+We recommend enabling TF32 tensor cores for matrix multiplications with ``torch.backends.cuda.matmul.fp32_precision = "tf32"`` (```torch.backends.cuda.matmul.allow_tf32 = True`` is going to be deprecated) if your network does not need full float32 precision.
+If your network needs full float32 precision for both matrix multiplications and convolutions, then TF32 tensor cores can also be disabled for convolutions with ``torch.backends.cudnn.conv.fp32_precision = "ieee"`` (``torch.backends.cudnn.allow_tf32 = False`` is going to be deprecated).
 
 For more information see :ref:`TensorFloat32<tf32_on_ampere>`.
 
@@ -109,6 +109,13 @@ reduced-precision reductions are problematic, they can be turned off with
 ``torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False``
 
 For more information see :ref:`allow_fp16_reduced_precision_reduction<fp16reducedprecision>` and :ref:`allow_bf16_reduced_precision_reduction<bf16reducedprecision>`
+
+Reduced Precision Reduction for FP16 and BF16 in Scaled Dot Product Attention (SDPA)
+------------------------------------------------------------------------------------
+A naive SDPA math backend, when using FP16/BF16 inputs, can accumulate significant numerical errors due to the usage of low-precision intermediate buffers. To mitigate this issue, the default behavior now involves upcasting FP16/BF16 inputs to FP32. Computations are performed in FP32/TF32, and the final FP32 results are then downcasted back to FP16/BF16. This will improve numerical accuracy of the final output for the math backend with FP16/BF16 inputs, but increases memory usages and may cause the performance regressions in the math backend as computations shift from FP16/BF16 BMM to FP32/TF32 BMM/Matmul.
+
+For scenarios where reduced-precision reductions are preferred for speed, they can be enabled with the following setting:
+``torch.backends.cuda.allow_fp16_bf16_reduction_math_sdp(True)``
 
 .. _fp16_on_mi200:
 

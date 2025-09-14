@@ -25,11 +25,6 @@
 #include <torch/csrc/jit/tensorexpr/ir_verifier.h>
 #include <torch/csrc/jit/tensorexpr/tensor.h>
 
-#include <stdexcept>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
-
 namespace torch::jit::tensorexpr {
 
 LoopNest::LoopNest(const LoopNest& other)
@@ -992,7 +987,7 @@ void LoopNest::inlineIntermediateBufs(bool allow_duplicated_work) {
         }
       }
 
-      // all bufs will have at least one store (if they have > 1 they cant be
+      // all bufs will have at least one store (if they have > 1 they can't be
       // inlined anyway)
       size_t reads = uses.size() - 1;
       // if only one read, we can inline it without duplicating work
@@ -1758,7 +1753,7 @@ std::vector<ForPtr> LoopNest::distributeLoopAndParentsOverInnerLoops(
 static bool areEqual(const ExprPtr& expr1, const ExprPtr& expr2) {
   auto diff = IRSimplifier::simplify(alloc<Sub>(expr1, expr2));
   return diff->isConstant() && (immediateAs<int>(diff) == 0);
-};
+}
 
 static bool doesExprContainAnyVar(
     const ExprPtr& expr,

@@ -57,7 +57,9 @@ C10_DECLARE_bool(caffe2_use_fatal_for_enforce);
 
 namespace c10 {
 
+#if !defined(C10_NODEPRECATED)
 using std::string;
+#endif
 
 // Functions that we use for initialization.
 C10_API bool InitCaffeLogging(int* argc, char** argv);
@@ -77,7 +79,7 @@ C10_API void UpdateLoggingLevelsFromFlags();
     const char* msg,
     const void* caller = nullptr);
 
-[[noreturn]] C10_API inline void ThrowEnforceNotMet(
+[[noreturn]] inline void ThrowEnforceNotMet(
     const char* file,
     const int line,
     const char* condition,
@@ -100,7 +102,7 @@ C10_API void UpdateLoggingLevelsFromFlags();
     const char* msg,
     const void* caller = nullptr);
 
-[[noreturn]] C10_API inline void ThrowEnforceFiniteNotMet(
+[[noreturn]] inline void ThrowEnforceFiniteNotMet(
     const char* file,
     const int line,
     const char* condition,
@@ -322,8 +324,8 @@ C10_API const std::unique_ptr<EventSampledHandler>& GetEventSampledHandler(
  *   // Logs caller info with an arbitrary text event, if there is a usage.
  *   C10_LOG_API_USAGE_ONCE("my_api");
  */
-#define C10_LOG_API_USAGE_ONCE(...)                        \
-  C10_UNUSED static bool C10_ANONYMOUS_VARIABLE(logFlag) = \
+#define C10_LOG_API_USAGE_ONCE(...)                              \
+  [[maybe_unused]] static bool C10_ANONYMOUS_VARIABLE(logFlag) = \
       ::c10::detail::LogAPIUsageFakeReturn(__VA_ARGS__);
 
 // API usage logging capabilities

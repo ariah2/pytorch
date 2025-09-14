@@ -1,7 +1,18 @@
 from collections import OrderedDict
+from typing import Any
 
 import torch
 from torch._C import _disabled_torch_function_impl
+
+
+__all__ = [
+    "Parameter",
+    "UninitializedParameter",
+    "is_lazy",
+    "Buffer",
+    "UninitializedBuffer",
+    "UninitializedTensorMixin",
+]
 
 
 # Metaclass to combine _TensorMeta and the instance check override for Parameter.
@@ -174,14 +185,20 @@ class UninitializedTensorMixin:
         )
 
 
-def is_lazy(param):
+def is_lazy(param: Any) -> bool:
+    """
+    Returns whether ``param`` is an ``UninitializedParameter`` or ``UninitializedBuffer``.
+
+    Args:
+        param (Any): the input to check.
+    """
     return isinstance(param, UninitializedTensorMixin)
 
 
 class UninitializedParameter(UninitializedTensorMixin, Parameter):
     r"""A parameter that is not initialized.
 
-    Uninitialized Parameters are a a special case of :class:`torch.nn.Parameter`
+    Uninitialized Parameters are a special case of :class:`torch.nn.Parameter`
     where the shape of the data is still unknown.
 
     Unlike a :class:`torch.nn.Parameter`, uninitialized parameters

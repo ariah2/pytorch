@@ -17,8 +17,7 @@
 #include <string>
 #include <utility>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 using ModuleQConfigMap = std::unordered_map<ModulePtr, std::optional<QConfig>>;
 
@@ -1703,7 +1702,7 @@ Module InsertObserversForOnDevicePTQ(
   // you will have multiple getattrs for the same attribute and thus potentially
   // multiple observers observing the same value. This will also lead to
   // increased size of the packed param struct. I dont expect this to be a
-  // common pattern but something to be aware fo Note that current quant
+  // common pattern but something to be aware of Note that current quant
   // workflow does not prevent this anyway since during inset quant dequant
   // things are inlined anyway
   helper.fillBoundaryValueMap(cloned_module, observer_method_name);
@@ -1720,5 +1719,4 @@ Module InsertObserversForOnDevicePTQ(
       cloned_module, observer_method_name, /* is_entry_point */ true);
   return cloned_module;
 }
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

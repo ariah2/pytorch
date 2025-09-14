@@ -130,6 +130,10 @@ struct PythonPrintImpl {
         stack->push_back(n->sourceRange());
       }
     }
+    WithSourceRange(const WithSourceRange&) = delete;
+    WithSourceRange(WithSourceRange&&) = delete;
+    WithSourceRange& operator=(const WithSourceRange&) = delete;
+    WithSourceRange& operator=(WithSourceRange&&) = delete;
 
     ~WithSourceRange() {
       stack->pop_back();
@@ -208,7 +212,7 @@ struct PythonPrintImpl {
   //     and would appear in the same order when the expression tree is
   //     reparsed.
   // The last case can be checked
-  // because when we emit a expresion tree in the parser,
+  // because when we emit a expression tree in the parser,
   // we do a left-to-right postorder traversal of the expression tree (emit
   // children, then emit op). The reverse of this is a right-to-left preorder
   // traversal of the tree. By doing a right-to-left preorder traversal of the
@@ -218,12 +222,12 @@ struct PythonPrintImpl {
   // expression.
 
   // The inductive step is that the right-most input should be produced by the
-  // node immediatly before the current node if it is in tree order.
+  // node immediately before the current node if it is in tree order.
 
   bool canInline(Value* v) {
     Node* n = v->node();
     // there must be only 1 values, otherwise we need an assignment to handle
-    // the multiple outout values
+    // the multiple output values
     if (n->outputs().size() != 1)
       return false;
     // if it is used more than once, then we need a variable
@@ -361,8 +365,9 @@ struct PythonPrintImpl {
       std::unordered_set<std::string>& used) {
     std::string name = candidate;
     while (used.count(name) || reserved_names.count(name)) {
-      // NOLINTNEXTLINE(performance-inefficient-string-concatenation)
-      name = candidate + std::to_string(next_id[name]++);
+      auto suffix = (next_id[name]++);
+      name.resize(candidate.size());
+      name.append(std::to_string(suffix));
     }
     used.insert(name);
     return name;
@@ -436,8 +441,7 @@ struct PythonPrintImpl {
   size_t level = 0;
   // indent to the current indent level
   TaggedStringStream& indent() {
-    for (const auto i : c10::irange(level)) {
-      (void)i; // Suppress unused variable warning
+    for ([[maybe_unused]] const auto i : c10::irange(level)) {
       body_ << "  ";
     }
     return body_;
@@ -455,7 +459,7 @@ struct PythonPrintImpl {
     auto it_b = list_b.begin();
 
     if (list_a.size() != list_b.size()) {
-      AT_ERROR("Python printer expected 2 lists of same size");
+      TORCH_CHECK(false, "Python printer expected 2 lists of same size");
     }
 
     for (; it_a != list_a.end(); ++it_a, ++it_b) {
@@ -647,7 +651,7 @@ struct PythonPrintImpl {
   // [reordering of inlines]
   // We inline anything that is semantically legal to inline, but sometimes
   // we find that these lines get too long. In that case we break the lines
-  /// and it  is important that we un-inline all the inputs preceeding the long
+  /// and it is important that we un-inline all the inputs preceding the long
   /// input:
   //   r = foo(x.add_(b), some_long + expression)
   //  wrong!
@@ -1299,8 +1303,7 @@ struct PythonPrintImpl {
   IValue createBroadList(dtype value, const int64_t& N) {
     c10::List<dtype> repeated;
     repeated.reserve(N);
-    for (const auto i : c10::irange(N)) {
-      (void)i; // Suppress unused variable warning
+    for ([[maybe_unused]] const auto i : c10::irange(N)) {
       repeated.push_back(value);
     }
     return repeated;
@@ -1407,7 +1410,7 @@ struct PythonPrintImpl {
         enforce_importable_(enforce_importable) {}
 
   void printClass(const ClassTypePtr& classType) {
-    // If any of the methods are not Graph funtions, this indicates that
+    // If any of the methods are not Graph functions, this indicates that
     // this class is a custom-bound C++ class. Skip serialization
     // of this class, we will depend on the ClassType being defined
     // in the target process.
@@ -1587,7 +1590,7 @@ struct PythonPrintImpl {
     } else if (auto enumType = type->cast<EnumType>()) {
       body_ << "class " << enumType->qualifiedClassName().name() << "(Enum):\n";
 
-      std::string value_wrapper = "";
+      std::string value_wrapper;
       if (enumType->getValueType() == StringType::get()) {
         value_wrapper = "\"";
       }

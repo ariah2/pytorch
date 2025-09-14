@@ -154,7 +154,7 @@ static void batchedTensorInplaceForLoopFallback(const c10::OperatorHandle& op, t
         "please file a bug report instead.");
     }
     batched_tensor_inputs.push_back(tensor);
-    batched_tensor_inputs_position.push_back(idx);
+    batched_tensor_inputs_position.push_back(static_cast<int64_t>(idx));
   }
   TORCH_INTERNAL_ASSERT(!batched_tensor_inputs.empty());
 
@@ -218,7 +218,7 @@ static Tensor safeStack(TensorList tensors) {
   // is possible for the backward function to return an undefined grad for some
   // grad_input for each example. In that case, we return an undefined grad.
   //
-  // It is theoretically posssible for *some* of the examples to produce an
+  // It is theoretically possible for *some* of the examples to produce an
   // undefined grad (a kernel could peek at the gradient values and return an
   // undefined tensor if it determines the gradient is full of zeros). We
   // could handle this by treating the undefined grad as a zero-filled tensor
@@ -288,7 +288,7 @@ void batchedTensorForLoopFallback(const c10::OperatorHandle& op, torch::jit::Sta
       continue;
     }
     batched_tensor_inputs.push_back(tensor);
-    batched_tensor_inputs_position.push_back(idx);
+    batched_tensor_inputs_position.push_back(static_cast<int64_t>(idx));
   }
   TORCH_INTERNAL_ASSERT(!batched_tensor_inputs.empty());
 

@@ -11,8 +11,7 @@
 
 #include <functional>
 
-namespace torch {
-namespace optim {
+namespace torch::optim {
 
 SGDOptions::SGDOptions(double lr) : lr_(lr) {}
 
@@ -85,7 +84,7 @@ Tensor SGD::step(LossClosure closure) {
         Tensor buf;
         auto param_state = state_.find(p.unsafeGetTensorImpl());
         if (param_state == state_.end()) {
-          buf = torch::clone(d_p).detach();
+          buf = d_p.detach().clone();
           auto state = std::make_unique<SGDParamState>();
           state->momentum_buffer(buf);
           state_[p.unsafeGetTensorImpl()] = std::move(state);
@@ -131,5 +130,4 @@ void SGD::load(serialize::InputArchive& archive) {
     }
   }
 }
-} // namespace optim
-} // namespace torch
+} // namespace torch::optim

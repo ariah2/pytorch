@@ -45,7 +45,7 @@ TORCH_API c10::intrusive_ptr<ConstantString> ConstantString::create(
 }
 
 TORCH_API c10::intrusive_ptr<ConstantString> ConstantString::create(
-    c10::string_view str_) {
+    std::string_view str_) {
   return c10::make_intrusive<ConstantString>(std::string(str_));
 }
 
@@ -96,6 +96,8 @@ c10::TypePtr IValue::TagType<c10::Type>::get(const IValue& v) {
       case Tag::ComplexDouble:
         return ComplexType::get();
       case Tag::Int:
+        return IntType::get();
+      case Tag::UInt:
         return IntType::get();
       case Tag::SymInt:
         return c10::SymIntType::get();
@@ -320,6 +322,8 @@ IValue IValue::equals(const IValue& rhs) const {
       return rhs.isComplexDouble() && lhs.toComplexDouble() == rhs.toComplexDouble();
     case Tag::Int:
       return rhs.isInt() && lhs.toInt() == rhs.toInt();
+    case Tag::UInt:
+      return rhs.isUnsigned() && lhs.toUInt() == rhs.toUInt();
     case Tag::SymInt:
       return rhs.isSymInt() && lhs.toSymInt() == rhs.toSymInt();
     case Tag::SymFloat:
@@ -379,6 +383,8 @@ size_t IValue::hash(const IValue& v) {
     case Tag::Int:
       return c10::get_hash(v.payload.u.as_int);
     // NB: these are technically strict aliasing violations
+    case Tag::UInt:
+      return c10::get_hash(v.payload.u.as_int);
     case Tag::SymInt:
       return c10::get_hash(v.payload.u.as_int);
     case Tag::SymFloat:
@@ -569,12 +575,7 @@ static std::ostream& printMaybeAnnotatedDict(
 static std::ostream& printComplex(std::ostream & out, const IValue & v) {
   c10::complex<double> d = v.toComplexDouble();
   IValue real(d.real()), imag(std::abs(d.imag()));
-  auto sign = "";
-  if (d.imag() >= 0) {
-    sign = "+";
-  } else {
-    sign = "-";
-  }
+  auto sign = d.imag() >= 0 ? '+' : '-';
   return out << real << sign << imag << "j";
 }
 
@@ -756,7 +757,7 @@ IValueComparator getLessThanComparator(const IValue& v) {
     torch::jit::Function* lt_func =
         checkObjectSortSchema(v.type()->expect<ClassType>(), why_not);
     if (!lt_func) {
-      AT_ERROR(why_not.str());
+      TORCH_CHECK(false, why_not.str());
     }
 
     return [lt_func](const IValue& a, const IValue& b) {
@@ -772,7 +773,7 @@ IValueComparator getLessThanComparator(const IValue& v) {
     };
   }
 
-  AT_ERROR("IValues of type: ", v.tagKind(), " are not comparable");
+  TORCH_CHECK(false, "IValues of type: ", v.tagKind(), " are not comparable");
 }
 
 IValueComparator getGreaterThanComparator(const IValue& v) {
@@ -811,6 +812,8 @@ std::ostream& operator<<(std::ostream & out, const IValue & v) {
       return printComplex(out, v);
     } case IValue::Tag::Int:
       return out << v.toInt();
+    case IValue::Tag::UInt:
+      return out << v.toUInt();
     case IValue::Tag::SymInt:
       return out << v.toSymInt();
     case IValue::Tag::SymFloat:
@@ -967,7 +970,7 @@ IValue IValue::deepcopy(
       copy = *this;
     } break;
     default: {
-      AT_ERROR("Can't deepcopy IValue with tag: ", tagKind());
+      TORCH_CHECK(false, "Can't deepcopy IValue with tag: ", tagKind());
     }
   }
   // NB: this doesn't work if an object contains itself, and it may
@@ -1050,7 +1053,7 @@ c10::intrusive_ptr<ivalue::Object> ivalue::Object::deepcopy(
       }
       err << ". Please define serialization methods via def_pickle() for "
             "this class.";
-      AT_ERROR(err.str());
+      TORCH_CHECK(false, err.str());
     }
     object->setSlot(i, slots_[i].deepcopy(memo, device));
   }

@@ -17,10 +17,10 @@
 #include <c10/util/irange.h>
 
 #include <cstring>
+#include <vector>
 
 
-namespace at {
-namespace native {
+namespace at::native {
 
 // Define a typedef to dispatch to nearest_idx or nearest_exact_idx
 typedef int64_t (*nn_compute_source_index_fn_t)(const float, int64_t, int64_t);
@@ -54,8 +54,8 @@ static void upsample_nearest2d_out_frame(
     return;
   }
 
-  std::unique_ptr<int64_t []> input_offset_arr(new int64_t[output_width]);
-  int64_t* input_offset = input_offset_arr.get();
+  std::vector<int64_t> input_offset_arr(output_width);
+  int64_t* input_offset = input_offset_arr.data();
 
   for (const auto w2 : c10::irange(output_width)) {
     const int64_t w1 = nn_compute_source_index_fn(width_scale, w2, input_width);
@@ -118,7 +118,7 @@ static void upsample_nearest2d_out_frame_nhwc(
 }
 
 template <nn_compute_source_index_fn_t nn_compute_source_index_fn>
-Tensor _upsample_nearest2d_quantized_cpu(
+static Tensor _upsample_nearest2d_quantized_cpu(
     const Tensor& input,
     IntArrayRef output_size,
     std::optional<double> scales_h,
@@ -218,5 +218,4 @@ Tensor _upsample_nearest_exact2d_quantized_cpu(
   return _upsample_nearest2d_quantized_cpu<nearest_neighbor_exact_compute_source_index>(input, osize, scale_h, scale_w);
 }
 
-} // namespace native
-} // namespace at
+} // namespace at::native

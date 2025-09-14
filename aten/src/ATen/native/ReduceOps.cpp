@@ -71,6 +71,8 @@
 #include <ATen/ops/exp.h>
 #include <ATen/ops/gather.h>
 #include <ATen/ops/gradient_native.h>
+#include <ATen/ops/hash_tensor.h>
+#include <ATen/ops/hash_tensor_native.h>
 #include <ATen/ops/imag.h>
 #include <ATen/ops/isnan_native.h>
 #include <ATen/ops/linalg_vector_norm.h>
@@ -218,6 +220,8 @@ static void check_argmax_argmin(
     const char* name,
     const Tensor& self,
     const std::optional<int64_t>& dim) {
+  TORCH_CHECK(!self.is_complex(), name, ": does not support complex input");
+  TORCH_CHECK(!(self.scalar_type() == kBool), name, ": does not support bool input");
   if (dim.has_value()) {
     auto dim_ = maybe_wrap_dim(dim.value(), self.dim());
     native::zero_numel_check_dims(self, dim_, name);
@@ -398,6 +402,19 @@ TORCH_META_FUNC(amin)
   resize_reduction(*this, self, dim, keepdim, out_dtype);
 }
 
+TORCH_META_FUNC(hash_tensor)
+(const Tensor& self, IntArrayRef dim, bool keepdim, int64_t mode) {
+  auto maybe_result = maybe_get_output();
+  if (maybe_result.defined()){
+    TORCH_CHECK(maybe_result.scalar_type() == at::kUInt64, "Expected result to be of dtype uint64, but got ", maybe_result.scalar_type());
+  }
+  if (self.sym_numel() == 0) {
+    native::zero_numel_check_dims(self, dim, "hash_tensor");
+  }
+  resize_reduction(*this, self, dim, keepdim, at::kUInt64);
+}
+
+
 } // namespace at::meta
 
 namespace at::native {
@@ -441,6 +458,7 @@ DEFINE_DISPATCH(argmin_stub);
 DEFINE_DISPATCH(cumsum_stub);
 DEFINE_DISPATCH(cumprod_stub);
 DEFINE_DISPATCH(logcumsumexp_stub);
+DEFINE_DISPATCH(xor_sum_stub);
 
 Tensor _logcumsumexp_cpu(const Tensor& self, int64_t dim) {
   Tensor result = at::empty_like(self, MemoryFormat::Contiguous);
@@ -472,7 +490,7 @@ Tensor& logcumsumexp_out(const Tensor& self, int64_t dim, Tensor& result) {
 }
 
 template <class Stub>
-void impl_func_cum_ops(
+static void impl_func_cum_ops(
     const Tensor& self,
     int64_t dim,
     const Tensor& result,
@@ -753,11 +771,11 @@ Tensor cumprod_backward(const Tensor& grad, const Tensor& input, int64_t dim, co
 namespace {
 #ifdef _MSC_VER
 template<typename T>
-inline typename std::enable_if<std::is_integral<T>::value, bool>::type isnan_(T x) {
+inline std::enable_if_t<std::is_integral_v<T>, bool> isnan_(T x) {
   return false;
 }
 template<typename T>
-inline typename std::enable_if<!std::is_integral<T>::value, bool>::type isnan_(T x) {
+inline std::enable_if_t<!std::is_integral_v<T>, bool> isnan_(T x) {
   return std::isnan(x);
 }
 #else
@@ -769,7 +787,7 @@ inline bool isnan_(T x) {
 }
 
 template<typename T1, typename T2, typename Operation>
-void cummax_cummin_helper(const T1* self_data, T1* values_data, T2* indices_data,
+static void cummax_cummin_helper(const T1* self_data, T1* values_data, T2* indices_data,
           int self_dim_size, int self_stride, int values_stride, int indices_stride) {
       Operation op;
       T1 out = c10::load(self_data);
@@ -796,6 +814,10 @@ void cummax_helper_cpu(const Tensor& self, Tensor& values, Tensor& indices, int6
 std::tuple<Tensor&, Tensor&> cummax_out(const Tensor& self, int64_t dim, Tensor& values, Tensor& indices) {
   check_scalar_type_device_layout_equal(values, self);
   check_scalar_type_device_layout_equal(indices, at::empty({0}, self.options().dtype(at::kLong)));
+  if (self.dim() == 0) {
+    at::native::zero_numel_check_dims(self, dim, "cummax()");
+  }
+
   {
     NoNamesGuard guard;
     at::native::resize_output(values, self.sizes());
@@ -831,6 +853,10 @@ void cummin_helper_cpu(const Tensor& self, Tensor& values, Tensor& indices, int6
 std::tuple<Tensor&, Tensor&> cummin_out(const Tensor& self, int64_t dim, Tensor& values, Tensor& indices) {
   check_scalar_type_device_layout_equal(values, self);
   check_scalar_type_device_layout_equal(indices, at::empty({0}, self.options().dtype(at::kLong)));
+  if (self.dim() == 0) {
+    at::native::zero_numel_check_dims(self, dim, "cummin()");
+  }
+
   {
     NoNamesGuard guard;
     at::native::resize_output(values, self.sizes());
@@ -931,7 +957,7 @@ static inline Tensor diff_helper(const Tensor& self, int64_t n, int64_t dim) {
   bool is_kBool = (self.dtype() == at::kBool);
   n = n > self.sym_size(dim) ? self.sym_size(dim).guard_int(__FILE__, __LINE__) : n;
 
-  for (C10_UNUSED const auto i : c10::irange(n)) {
+  for ([[maybe_unused]] const auto i : c10::irange(n)) {
     if (is_kBool) {
       result = at::logical_xor(
         at::narrow_symint(result, dim, 1, out_len),
@@ -1174,7 +1200,7 @@ std::vector<Tensor> gradient(const Tensor& self, IntArrayRef dim, int64_t edge_o
 
 // ALL REDUCE #################################################################
 
-inline bool should_use_acc_buffer(at::TensorIterator& iter) {
+static inline bool should_use_acc_buffer(at::TensorIterator& iter) {
   const auto ndim = iter.ndim();
   if (!iter.device().is_cpu() || iter.noutputs() != 1) {
     return false;
@@ -1236,7 +1262,7 @@ Tensor& sum_out(const Tensor& self, DimnameList dim,
 Tensor& nansum_out(const Tensor& self, at::OptionalIntArrayRef dim,
                        bool keepdim, std::optional<ScalarType> opt_dtype, Tensor& result) {
   if (self.device().is_cpu()) {
-    TORCH_CHECK(!c10::isComplexType(self.scalar_type()), "nansum does not support complex inputs");
+    TORCH_CHECK(!c10::isComplexType(self.scalar_type()), "nansum on CPU does not support complex inputs");
   }
 
   // For integral types, use existing sum as
@@ -1366,7 +1392,6 @@ TORCH_IMPL_FUNC(mean_out)
         dim_prod *= self.size(d);
       }
     }
-    auto& result_mut = const_cast<Tensor&>(result);
     // For accuracy reasons, BF16/FP16 mean should be computed via the
     // following approach:
     //  cast_fp32 -> sum -> div -> cast_bf16_or_fp16
@@ -1378,7 +1403,7 @@ TORCH_IMPL_FUNC(mean_out)
     // which, in turn, does not produce as accurate results.
     bool is_half_type = (dtype == kHalf || dtype == kBFloat16);
     auto sum_out_dtype = is_half_type ? ScalarType::Float : dtype;
-    result_mut = is_half_type ? result_mut.to(sum_out_dtype) : result_mut;
+    auto result_temp = is_half_type ? result.to(sum_out_dtype) : result;
     // If dtype is FP16 or BF16, self (input tensor) will initially be cast to
     // FP32 in sum_out. This results in having to read that FP32 tensor again,
     // but maybe in the future, we could revise the implementation to not
@@ -1386,9 +1411,14 @@ TORCH_IMPL_FUNC(mean_out)
     // require some modifications in binary_kernel_reduce_vec(),
     // TensorIteratorBase::for_each(), and
     // TensorIteratorBase::serial_for_each(), apart from sum kernel for CPU.
-    at::sum_out(result_mut, self, opt_dim, keepdim, sum_out_dtype).div_(dim_prod);
-    // After sum & div, cast result_mut back to BF16 or FP16, if required.
-    result_mut = is_half_type ? result_mut.to(dtype) : result_mut;
+    at::sum_out(result_temp, self, opt_dim, keepdim, sum_out_dtype).div_(dim_prod);
+    // After sum & div, cast result_temp back to BF16 or FP16, if required.
+    // It cannot be avoided copy_() if we promotion the out of sum op, because of
+    // the result needs to be update and the storage of result tensor cannot be reused
+    // by sum op. We do not need explicit call to(dtype) func as copy_() do it.
+    if (is_half_type) {
+      result.copy_(result_temp);
+    }
   } else {
     // device is not CPU
     auto iter = at::meta::make_reduction_from_out_ty(
@@ -1430,12 +1460,16 @@ Tensor& nanmean_out(
     bool keepdim,
     std::optional<ScalarType> opt_dtype,
     Tensor& result) {
+  // Check if dtype is an integral type or Bool and raise an error
+  TORCH_CHECK(
+    !at::isIntegralType(self.scalar_type(), /*includeBool=*/true),
+    "nanmean(): integral types and 'Bool' are not supported for nanmean, even for empty tensors.");
   TORCH_CHECK(
       self.is_floating_point() || self.is_complex(),
       "nanmean(): expected input to have floating point or complex dtype but got ",
       self.scalar_type());
   const auto factor = at::native::isnan(self).logical_not_().sum(dim, keepdim);
-  at::native::nansum_out(self, dim, keepdim, opt_dtype, result).div_(factor);
+  at::nansum_out(result, self, dim, keepdim, opt_dtype).div_(factor);
   return result;
 }
 
@@ -1575,7 +1609,7 @@ Tensor norm(const Tensor& self, const Scalar& p) {
   return at::norm(self, p, IntArrayRef{}, false);
 }
 
-inline TensorIterator get_allany_iter(
+static inline TensorIterator get_allany_iter(
     const Tensor& self,
     const Tensor& result,
     OptionalIntArrayRef dims,
@@ -1592,7 +1626,7 @@ inline TensorIterator get_allany_iter(
 }
 
 template <int identity, typename Stub>
-inline void allany_impl(
+static inline void allany_impl(
     const Tensor& self,
     const Tensor& result,
     OptionalIntArrayRef dims,
@@ -1637,7 +1671,7 @@ TORCH_IMPL_FUNC(any_all_out)(const Tensor& self, const Tensor& result) {
 }
 
 template <bool is_all>
-Tensor allany_dims_default(const Tensor &self, OptionalIntArrayRef dim, bool keepdim) {
+static Tensor allany_dims_default(const Tensor &self, OptionalIntArrayRef dim, bool keepdim) {
   // Default implementation in terms of all-reduce or single dim reduce
   if (!dim) {
     Tensor out;
@@ -1716,7 +1750,7 @@ TORCH_IMPL_FUNC(amax_out) (const Tensor& self, IntArrayRef dim, bool keepdim, co
 }
 
 template <class Stub>
-void argmax_argmin_impl(
+static void argmax_argmin_impl(
     const Tensor& self,
     std::optional<int64_t> dim,
     bool keepdim,
@@ -1973,7 +2007,7 @@ std::tuple<Tensor, Tensor> var_mean(
     const Tensor& self, at::OptionalIntArrayRef dim, bool unbiased, bool keepdim) {
   return at::var_mean(
       self, /*dim=*/at::OptionalIntArrayRef(dim),
-      /*correction=*/std::make_optional<Scalar>(unbiased ? 1 : 0),
+      /*correction=*/Scalar(unbiased ? 1 : 0),
       keepdim);
 }
 
@@ -1981,20 +2015,20 @@ std::tuple<Tensor, Tensor> std_mean(
     const Tensor& self, at::OptionalIntArrayRef dim, bool unbiased, bool keepdim) {
   return at::std_mean(
       self, /*dim=*/at::OptionalIntArrayRef(dim),
-      /*correction=*/std::make_optional<Scalar>(unbiased ? 1 : 0),
+      /*correction=*/Scalar(unbiased ? 1 : 0),
       keepdim);
 }
 
 std::tuple<Tensor, Tensor> std_mean(const Tensor& self, bool unbiased) {
   return at::std_mean(
       self, /*dim=*/std::nullopt,
-      /*correction=*/std::make_optional<Scalar>(unbiased ? 1 : 0));
+      /*correction=*/Scalar(unbiased ? 1 : 0));
 }
 
 std::tuple<Tensor, Tensor> var_mean(const Tensor& self, bool unbiased) {
   return at::var_mean(
       self, /*dim=*/std::nullopt,
-      /*correction=*/std::make_optional<Scalar>(unbiased ? 1 : 0));
+      /*correction=*/Scalar(unbiased ? 1 : 0));
 }
 std::tuple<Tensor&, Tensor&> var_mean_out(
     Tensor& result1, Tensor& result2, const Tensor& self, IntArrayRef dim,
@@ -2029,36 +2063,36 @@ std::tuple<Tensor, Tensor> std_mean(
 Tensor var(const Tensor& self, bool unbiased) {
   return at::var(
       self, /*dim=*/std::nullopt,
-      /*correction=*/std::make_optional<Scalar>(unbiased ? 1 : 0));
+      /*correction=*/Scalar(unbiased ? 1 : 0));
 }
 
 Tensor var(const Tensor& self, at::OptionalIntArrayRef dim, bool unbiased, bool keepdim) {
   return at::var(
       self, /*dim=*/at::OptionalIntArrayRef(dim),
-      /*correction=*/std::make_optional<Scalar>(unbiased ? 1 : 0),
+      /*correction=*/Scalar(unbiased ? 1 : 0),
       keepdim);
 }
 
 Tensor& var_out(const Tensor& self, at::OptionalIntArrayRef dim, bool unbiased, bool keepdim, Tensor& result) {
   return at::var_out(
       result, self, /*dim=*/at::OptionalIntArrayRef(dim),
-      /*correction=*/std::make_optional<Scalar>(unbiased ? 1 : 0),
+      /*correction=*/Scalar(unbiased ? 1 : 0),
       keepdim);
 }
 
 Tensor std(const Tensor& self, bool unbiased) {
   return at::std(
-      self, /*dim=*/std::nullopt, /*correction=*/std::make_optional<Scalar>(unbiased ? 1 : 0));
+      self, /*dim=*/std::nullopt, /*correction=*/Scalar(unbiased ? 1 : 0));
 }
 
 Tensor std(const Tensor& self, at::OptionalIntArrayRef dim, bool unbiased, bool keepdim) {
   return at::std(self, dim,
-                 /*correction=*/std::make_optional<Scalar>(unbiased ? 1 : 0), keepdim);
+                 /*correction=*/Scalar(unbiased ? 1 : 0), keepdim);
 }
 
 Tensor& std_out(const Tensor& self, at::OptionalIntArrayRef opt_dim, bool unbiased, bool keepdim, Tensor& result) {
   return at::std_out(result, self, opt_dim,
-                     /*correction=*/std::make_optional<Scalar>(unbiased ? 1 : 0), keepdim);
+                     /*correction=*/Scalar(unbiased ? 1 : 0), keepdim);
 }
 
 Tensor std(const Tensor& self, at::OptionalIntArrayRef dim,
@@ -2217,6 +2251,24 @@ Tensor dist(const Tensor &self, const Tensor& other, const Scalar& p){
   return at::norm(self - other, p);
 }
 
+enum class HashMode { XOR_SUM = 0 };
+
+TORCH_IMPL_FUNC(hash_tensor_out) (const Tensor& self, IntArrayRef dim, bool keepdim, int64_t mode, const Tensor& result)  {
+
+  auto iter = meta::make_reduction(self, result, dim, keepdim, self.scalar_type());
+  switch (static_cast<HashMode>(mode)) {
+    case HashMode::XOR_SUM:
+      if (iter.numel() == 0) {
+          result.fill_(0);
+      } else {
+        xor_sum_stub(iter.device_type(), iter);
+      }
+      return;
+    default:
+      TORCH_CHECK(false, "Unknown hash_tensor mode: ", mode);
+  }
+}
+
 bool cpu_equal(const Tensor& self, const Tensor& other) {
   if (!at::namedinference::are_names_equal(
         self.unsafeGetTensorImpl(), other.unsafeGetTensorImpl())) {
@@ -2251,7 +2303,7 @@ bool cpu_equal(const Tensor& self, const Tensor& other) {
             return;
         }
         char* self_data = data[0];
-        for (C10_UNUSED const auto i : c10::irange(dim_size)) {
+        for ([[maybe_unused]] const auto i : c10::irange(dim_size)) {
           if (isnan_(c10::load<scalar_t>(self_data))) {
             result = false;
             return;
@@ -2278,7 +2330,7 @@ bool cpu_equal(const Tensor& self, const Tensor& other) {
       }
       char* self_data = data[0];
       char* other_data = data[1];
-      for (C10_UNUSED const auto i : c10::irange(dim_size)) {
+      for ([[maybe_unused]] const auto i : c10::irange(dim_size)) {
         if (c10::load<scalar_t>(self_data) != c10::load<scalar_t>(other_data)) {
           result = false;
           return;
@@ -2287,7 +2339,7 @@ bool cpu_equal(const Tensor& self, const Tensor& other) {
         other_data += strides[1];
       }
     });
-  }), kBool, kBFloat16, kHalf, AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES));
+  }), kBool, kBFloat16, kHalf, AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX), AT_EXPAND(AT_FLOAT8_TYPES), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES));
   return result.load();
 }
 

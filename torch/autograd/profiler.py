@@ -1,8 +1,10 @@
 # mypy: allow-untyped-defs
+import uuid
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from time import perf_counter_ns
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Optional
 from warnings import warn
 
 import torch
@@ -93,6 +95,7 @@ def _run_on_profiler_stop():
 @dataclass
 class _ProfilerStats:
     "Profiler timing and stats used by developers to catch issues/regressions"
+
     profiling_window_duration_sec: float = 0
     number_of_events: int = 0
     profiler_prepare_call_duration_us: int = 0
@@ -104,6 +107,9 @@ class _ProfilerStats:
 
 class profile:
     """Context manager that manages autograd profiler state and holds a summary of results.
+
+    .. note::
+        This is the backend, most people should use :mod:`torch.profiler` instead.
 
     Under the hood it just records events of functions being executed in C++ and
     exposes those events to Python. You can wrap any code into it and it will
@@ -158,16 +164,16 @@ class profile:
         acc_events (bool): Enable the accumulation of FunctionEvents across multiple profiling cycles
 
 
-    .. warning:
+    .. warning::
         Enabling memory profiling or source attribution incurs additional profiler
         overhead
 
-    .. warning:
+    .. warning::
         This context managers should not be called recursively, i.e. no nested
         instances are allowed
 
-    .. warning:
-        Due to some CUDA multiprocessing limitations (multiprocessing-cuda-note_),
+    .. warning::
+        Due to some CUDA multiprocessing limitations (see :ref:`multiprocessing-cuda-note`),
         one cannot use the profiler with ``use_device = 'cuda'`` to benchmark
         DataLoaders with ``num_workers > 0``. If you wish to benchmark data loading,
         please use ``use_device = None`` or ``num_workers = 0``.
@@ -209,6 +215,7 @@ class profile:
         use_cpu=True,
         experimental_config=None,
         acc_events=False,
+        custom_trace_id_callback=None,
     ):
         self.enabled: bool = enabled
         if not self.enabled:
@@ -245,14 +252,15 @@ class profile:
         self.profiling_start_time_ns = 0
         self.profiling_end_time_ns = 0
         self._stats = _ProfilerStats()
-
+        self.custom_trace_id_callback = custom_trace_id_callback
+        self.trace_id = ""
         if not self.use_cpu:
-            assert (
-                use_kineto
-            ), "Device-only events supported only with Kineto (use_kineto=True)"
+            assert use_kineto, (
+                "Device-only events supported only with Kineto (use_kineto=True)"
+            )
 
         if self.use_device is not None:
-            VALID_DEVICE_OPTIONS = ["cuda", "xpu", "mtia"]
+            VALID_DEVICE_OPTIONS = ["cuda", "xpu", "mtia", "hpu"]
             if _get_privateuse1_backend_name() != "privateuseone":
                 VALID_DEVICE_OPTIONS.append(_get_privateuse1_backend_name())
             if self.use_device not in VALID_DEVICE_OPTIONS:
@@ -268,6 +276,12 @@ class profile:
                 warn("XPU is not available, disabling XPU profiling")
                 self.use_device = None
 
+            if self.use_device == "hpu" and not (
+                hasattr(torch, "hpu") and torch.hpu.is_available()
+            ):
+                warn("HPU is not available, disabling HPU profiling")
+                self.use_device = None
+
         self.kineto_activities = set()
         if self.use_cpu:
             self.kineto_activities.add(ProfilerActivity.CPU)
@@ -280,32 +294,52 @@ class profile:
             else:
                 self.kineto_activities.add(ProfilerActivity.CUDA)
         elif self.use_device == "xpu":
-            assert (
-                use_kineto and ProfilerActivity.XPU in _supported_activities()
-            ), "Legacy XPU profiling is not supported. Requires use_kineto=True on XPU devices."
+            assert use_kineto and ProfilerActivity.XPU in _supported_activities(), (
+                "Legacy XPU profiling is not supported. Requires use_kineto=True on XPU devices."
+            )
             self.kineto_activities.add(ProfilerActivity.XPU)
         elif self.use_device == "mtia":
-            assert (
-                use_kineto and ProfilerActivity.MTIA in _supported_activities()
-            ), "Legacy MTIA profiling is not supported. Requires use_kineto=True on MTIA devices."
+            assert use_kineto and ProfilerActivity.MTIA in _supported_activities(), (
+                "Legacy MTIA profiling is not supported. Requires use_kineto=True on MTIA devices."
+            )
             self.kineto_activities.add(ProfilerActivity.MTIA)
+        elif self.use_device == "hpu":
+            assert use_kineto and ProfilerActivity.HPU in _supported_activities(), (
+                "Legacy HPU profiling is not supported. Requires use_kineto=True on HPU devices."
+            )
+            self.kineto_activities.add(ProfilerActivity.HPU)
         elif self.use_device is not None and self.use_device != "privateuseone":
             if (
                 not use_kineto
                 or ProfilerActivity.PrivateUse1 not in _supported_activities()
             ):
-                assert (
-                    self.use_cpu
-                ), "Legacy custombackend profiling requires use_cpu=True"
+                assert self.use_cpu, (
+                    "Legacy custombackend profiling requires use_cpu=True"
+                )
                 self.profiler_kind = ProfilerState.KINETO_PRIVATEUSE1_FALLBACK
             else:
                 self.kineto_activities.add(ProfilerActivity.PrivateUse1)
 
-        assert (
-            len(self.kineto_activities) > 0
-        ), "No activities specified for the profiler"
+        assert len(self.kineto_activities) > 0, (
+            "No activities specified for the profiler"
+        )
 
-    def config(self):
+    def default_trace_id(self):
+        # Generate a UUID
+        uuid_raw = uuid.uuid4()
+
+        return f"{uuid_raw.int:032X}"
+
+    def create_trace_id(self):
+        if self.custom_trace_id_callback:
+            return self.custom_trace_id_callback()
+        return self.default_trace_id()
+
+    def config(self, create_trace_id=False):
+        # only need to generate new trace id upon prepare trace not start trace
+        if create_trace_id:
+            trace_id = self.create_trace_id()
+            self.trace_id = trace_id
         return ProfilerConfig(
             self.profiler_kind,
             self.record_shapes,
@@ -314,6 +348,7 @@ class profile:
             self.with_flops,
             self.with_modules,
             self.experimental_config,
+            self.trace_id,
         )
 
     def __enter__(self):
@@ -328,7 +363,7 @@ class profile:
     def _prepare_trace(self):
         self.entered = True
         t0 = perf_counter_ns()
-        _prepare_profiler(self.config(), self.kineto_activities)
+        _prepare_profiler(self.config(create_trace_id=True), self.kineto_activities)
         t1 = perf_counter_ns()
         self._stats.profiler_prepare_call_duration_us = int((t1 - t0) / 1000)
 
@@ -336,7 +371,7 @@ class profile:
         self.entered = True
         _run_on_profiler_start()
         t0 = perf_counter_ns()
-        _enable_profiler(self.config(), self.kineto_activities)
+        _enable_profiler(self.config(create_trace_id=False), self.kineto_activities)
         t1 = perf_counter_ns()
         self._stats.profiler_enable_call_duration_us = int((t1 - t0) / 1000)
         self.profiling_start_time_ns = t1
@@ -368,7 +403,7 @@ class profile:
         )
 
         # If we plan to accumulate events we should post process the function events
-        # right away to retain the state across mulitple start/stop calls
+        # right away to retain the state across multiple start/stop calls
         if self.acc_events:
             self._ensure_function_events()
         return False
@@ -477,11 +512,16 @@ class profile:
         """
         return _toggle_collection_dynamic(enabled, set(activities))
 
-    def key_averages(self, group_by_input_shape=False, group_by_stack_n=0):
+    def key_averages(
+        self,
+        group_by_input_shape=False,
+        group_by_stack_n=0,
+        group_by_overload_name=False,
+    ):
         self._ensure_function_events()
         assert self._function_events is not None, "Expected profiling results"
         return self._function_events.key_averages(
-            group_by_input_shape, group_by_stack_n
+            group_by_input_shape, group_by_stack_n, group_by_overload_name
         )
 
     key_averages.__doc__ = EventList.key_averages.__doc__
@@ -527,7 +567,12 @@ class profile:
             return (
                 mem_record.nbytes()
                 if mem_record.device_type()
-                in [DeviceType.CUDA, DeviceType.PrivateUse1, DeviceType.HIP]
+                in [
+                    DeviceType.CUDA,
+                    DeviceType.PrivateUse1,
+                    DeviceType.HIP,
+                    DeviceType.XPU,
+                ]
                 else 0
             )
 
@@ -538,10 +583,13 @@ class profile:
         # frontend_function_events contains the events in aten or torch frontend level,
         # whose correlation id is 0
         frontend_function_events = []
-        device_corr_map: Dict[int, List[FunctionEvent]] = {}
+        device_corr_map: dict[int, list[FunctionEvent]] = {}
         max_evt_id = 0
         for kineto_event in result.events():
-            if _filter_name(kineto_event.name()):
+            if (
+                _filter_name(kineto_event.name())
+                or getattr(kineto_event, "is_hidden_event", lambda: False)()
+            ):
                 continue
             rel_start_ns = kineto_event.start_ns() - trace_start_ns
             rel_end_ns = kineto_event.end_ns() - trace_start_ns
@@ -565,6 +613,7 @@ class profile:
             fe = FunctionEvent(
                 id=kineto_event.correlation_id(),
                 name=_rewrite_name(name=kineto_event.name(), with_wildcard=True),
+                overload_name=kineto_event.overload_name(),
                 trace_name=_rewrite_name(name=kineto_event.name(), with_wildcard=False),
                 thread=kineto_event.start_thread_id(),
                 start_us=rel_start_ns / 1000,
@@ -592,7 +641,7 @@ class profile:
             )
             max_evt_id = max(max_evt_id, fe.id)
             if fe.device_type == DeviceType.CPU and not fe.is_async:
-                if self.use_device == "privateuseone":
+                if self.use_device == _get_privateuse1_backend_name():
                     privateuse1_time = kineto_event.privateuse1_elapsed_us()
                     if privateuse1_time > 0:
                         fe.append_kernel(fe.name, fe.device_index, privateuse1_time)
@@ -644,6 +693,7 @@ class profile:
             fe = FunctionEvent(
                 id=max_evt_id,
                 name=evt.name(),
+                overload_name="",
                 trace_name=None,  # not outputting in the trace
                 thread=evt.start_thread_id(),
                 start_us=rel_start_ns / 1000,
@@ -695,11 +745,12 @@ class record_function(_ContextDecorator):
         >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_AUTOGRAD_PROFILER)
         >>> x = torch.randn((1, 1), requires_grad=True)
         >>> with torch.autograd.profiler.profile() as prof:
-        ...     y = x ** 2
-        ...     with torch.autograd.profiler.record_function("label-z"): # label the block
-        ...         z = y ** 3
+        ...     y = x**2
+        ...     with torch.autograd.profiler.record_function(
+        ...         "label-z"
+        ...     ):  # label the block
+        ...         z = y**3
         ...     y.backward()
-        ...
         >>> # xdoctest: +IGNORE_WANT
         >>> # NOTE: some columns were removed for brevity
         >>> print(prof.key_averages().table(sort_by="self_cpu_time_total"))
@@ -806,7 +857,7 @@ class emit_itt:
     The Instrumentation and Tracing Technology (ITT) API enables your application to generate and
     control the collection of trace data during its execution across different Intel tools.
     This context manager is to annotate Intel(R) VTune Profiling trace. With help of this context manager,
-    you will be able to see labled ranges in Intel(R) VTune Profiler GUI.
+    you will be able to see labeled ranges in Intel(R) VTune Profiler GUI.
 
     .. warning:
         This context manager should not be called recursively, i.e. at most one
@@ -1122,7 +1173,7 @@ class KinetoStepTracker:
     """
 
     _current_step = 0
-    _step_dict: Dict[str, int] = defaultdict(int)
+    _step_dict: dict[str, int] = defaultdict(int)
 
     @classmethod
     def init_step_count(cls, requester: str):

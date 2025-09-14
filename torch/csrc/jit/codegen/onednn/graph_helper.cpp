@@ -5,10 +5,7 @@
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 
-namespace torch {
-namespace jit {
-namespace fuser {
-namespace onednn {
+namespace torch::jit::fuser::onednn {
 
 using opkind = dnnl::graph::op::kind;
 
@@ -73,7 +70,7 @@ Operator LlgaGraphHelper::makeBinaryOp(Node* node, opkind kind) {
 // third_party/ideep/mkl-dnn/src/interface/op_def.hpp.
 Operator LlgaGraphHelper::createOperator(Node* node) {
   auto nodeKind = node->kind();
-  // we're using an if-else clause instead of a switch staement
+  // we're using an if-else clause instead of a switch statement
   // because we would soon be adding custom ops with function schemas.
   // We would have to use Symbol::fromQualString at that time anyway,
   // but we are okay with this choice, since this code is not in the hot-path.
@@ -615,7 +612,4 @@ bool LlgaNodeWrapper::useOpaqueLayout(size_t offset) const {
   return n->is(attr::output_layouts)[offset] == OPAQUE_LAYOUT;
 }
 
-} // namespace onednn
-} // namespace fuser
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::fuser::onednn

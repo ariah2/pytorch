@@ -75,6 +75,8 @@ class TORCH_API ThreadLocalState {
 
   bool functionalization_reapply_views_state_;
 
+  bool dtensor_allow_implicit_replication_;
+
   // TLS for arbitrary python objects that is registered via hooks
   at::impl::ThreadLocalPythonObjects saved_objects_;
 
@@ -82,7 +84,7 @@ class TORCH_API ThreadLocalState {
     !defined(BUILD_LITE_INTERPRETER)
   // TLS for autocast dtypes
   std::array<at::ScalarType, at::COMPILE_TIME_MAX_DEVICE_TYPES>
-      autocast_dtypes_;
+      autocast_dtypes_{};
 #endif
 
   friend class ThreadLocalStateGuard;
@@ -96,6 +98,10 @@ class TORCH_API ThreadLocalStateGuard {
     // set the given state across the thread boundary
     ThreadLocalState::setThreadLocalState(state);
   }
+  ThreadLocalStateGuard(ThreadLocalStateGuard&& other) = delete;
+  ThreadLocalStateGuard(const ThreadLocalStateGuard&) = delete;
+  ThreadLocalStateGuard& operator=(const ThreadLocalStateGuard&) = delete;
+  ThreadLocalStateGuard& operator=(ThreadLocalStateGuard&&) = delete;
 
   ~ThreadLocalStateGuard() {
     // restore previously set variables

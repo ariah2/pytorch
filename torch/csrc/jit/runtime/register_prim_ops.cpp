@@ -37,9 +37,8 @@ std::string stringSlice(
       slice_indices_adjust(string.size(), &start_val, &end_val, step);
 
   int64_t i = start_val;
-  std::string result = "";
-  for (const auto j : c10::irange(num_vals)) {
-    (void)j; // Suppress unused variable warning
+  std::string result;
+  for ([[maybe_unused]] const auto j : c10::irange(num_vals)) {
     result += string[i];
     i += step;
   }
@@ -116,8 +115,8 @@ bool isSortableListOfObjectsOrTuples(
   }
 
   auto type = ivalues.get(0).type();
-  // We assume lists have homogenous types, use first element to determine
-  // best sorting methods. If in the future we need to support heterogenous
+  // We assume lists have homogeneous types, use first element to determine
+  // best sorting methods. If in the future we need to support heterogeneous
   // types inside list, then sorting needs to have runtime sortable checks.
   const size_t n = ivalues.size();
   for (const auto i : c10::irange(n)) {
@@ -1042,7 +1041,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         [](Stack& stack) {
           at::Tensor t = pop(stack).toTensor();
           if (t.dim() == 0) {
-            AT_ERROR("len() of a 0-d tensor");
+            TORCH_CHECK(false, "len() of a 0-d tensor");
           }
           push(stack, t.sizes()[0]);
         },
@@ -1142,7 +1141,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
     //
     // create a clone of these declarations with a _hacked_twin overload name
     // and nullability scrubbed from TensorList arg types
-    // TOOD find out why this exists and how to do it without the hack
+    // TODO find out why this exists and how to do it without the hack
     //
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA(
@@ -1310,7 +1309,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         [](Stack& stack) {
           at::Tensor a;
           pop(stack, a);
-          push(stack, autograd::Variable(a).variable_data());
+          push(stack, a.variable_data());
         },
         aliasAnalysisFromSchema()),
 // these ops are not defined for Tensor
@@ -1348,7 +1347,7 @@ static const std::vector<OperatorGeneratorArgs> opGenArgs{
         auto string = pop(stack).toStringRef();                        \
         push(                                                          \
             stack,                                                     \
-            string.size() != 0 &&                                      \
+            !string.empty() &&                                         \
                 std::all_of(string.begin(), string.end(), [](char c) { \
                   return char_op(c);                                   \
                 }));                                                   \
@@ -1489,7 +1488,7 @@ void dictPop(Stack& stack) {
     if (has_default) {
       push(stack, default_value);
     } else {
-      AT_ERROR("KeyError: ", key);
+      TORCH_CHECK(false, "KeyError: ", key);
     }
   } else {
     // note: before erase
@@ -1509,7 +1508,7 @@ void dictDelete(Stack& stack) {
 void dictPopItem(Stack& stack) {
   auto dict = pop(stack).toGenericDict();
   if (dict.empty()) {
-    AT_ERROR("popitem(): dictionary is empty");
+    TORCH_CHECK(false, "popitem(): dictionary is empty");
   }
   auto head_item = dict.begin();
 
@@ -2840,7 +2839,7 @@ void hashValue(Stack& stack) {
 }
 
 static const std::vector<OperatorGeneratorArgs> opGenArgs2{
-    // registered as Any[] so that heterogenous tuples can be called with len()
+    // registered as Any[] so that heterogeneous tuples can be called with len()
     OperatorGeneratorArgs(
         TORCH_SELECTIVE_SCHEMA("aten::len.any(Any[] a) -> int"),
         listLen,
